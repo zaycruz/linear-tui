@@ -13,7 +13,7 @@ import (
 
 const (
 	openRouterEndpoint = "https://openrouter.ai/api/v1/chat/completions"
-	chatModel          = "minimax/minimax-m1-2.7"
+	chatModel          = "minimax/minimax-m2.7"
 )
 
 // ChatMessage is a single turn in a chat conversation.
