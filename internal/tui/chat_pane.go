@@ -86,6 +86,29 @@ func (c *ChatPane) addAssistant(text string) {
 	c.Busy = false
 }
 
+// startStream writes the "AI: " header for a streaming response.
+// Call this before the first token arrives.
+func (c *ChatPane) startStream() {
+	if c.buf.Len() > 0 {
+		c.buf.WriteString("\n")
+	}
+	c.buf.WriteString("[cyan]AI:[white]  ")
+	c.history.SetText(c.buf.String())
+	c.history.ScrollToEnd()
+}
+
+// appendToken appends a single streamed token and refreshes the view.
+func (c *ChatPane) appendToken(token string) {
+	c.buf.WriteString(tview.Escape(token))
+	c.history.SetText(c.buf.String())
+	c.history.ScrollToEnd()
+}
+
+// finalizeStream marks the response complete after streaming finishes.
+func (c *ChatPane) finalizeStream() {
+	c.Busy = false
+}
+
 func (c *ChatPane) addError(msg string) {
 	if c.buf.Len() > 0 {
 		c.buf.WriteString("\n")

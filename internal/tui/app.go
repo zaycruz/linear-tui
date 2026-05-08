@@ -1439,6 +1439,7 @@ func (a *App) handleChatSubmit(text string) {
 	system := a.buildChatSystemPrompt()
 	executor := &AppExecutor{app: a}
 
+	streamStarted := false
 	a.chatClient.RunAgent(
 		context.Background(),
 		system,
@@ -1449,14 +1450,28 @@ func (a *App) handleChatSubmit(text string) {
 				a.chatPane.setStatus(status)
 			})
 		},
+		func(token string) {
+			a.queueUpdateDraw(func() {
+				if !streamStarted {
+					streamStarted = true
+					a.chatPane.startStream()
+				}
+				a.chatPane.appendToken(token)
+			})
+		},
 		func(reply string, err error) {
 			a.queueUpdateDraw(func() {
 				if err != nil {
 					a.chatPane.addError(err.Error())
 					return
 				}
+				if !streamStarted {
+					// No tokens were streamed (empty response) — fall back to addAssistant
+					a.chatPane.addAssistant(reply)
+				} else {
+					a.chatPane.finalizeStream()
+				}
 				a.chatHistory = append(a.chatHistory, agents.ChatMessage{Role: "assistant", Content: reply})
-				a.chatPane.addAssistant(reply)
 			})
 		},
 	)

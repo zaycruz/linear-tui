@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -45,24 +46,43 @@ func (c *ChatClient) Available() bool {
 	return c.apiKey != ""
 }
 
-type completionResponse struct {
+// streamChunk is one SSE delta from the OpenRouter streaming API.
+type streamChunk struct {
 	Choices []struct {
-		Message struct {
-			Role      string     `json:"role"`
-			Content   *string    `json:"content"`
-			ToolCalls []ToolCall `json:"tool_calls"`
-		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
+		Delta struct {
+			Role      string  `json:"role"`
+			Content   *string `json:"content"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
 }
 
-func (c *ChatClient) complete(ctx context.Context, messages []ChatMessage, useTools bool) (*completionResponse, error) {
+// turnResult is the assembled output of one streaming turn.
+type turnResult struct {
+	content      string
+	toolCalls    []ToolCall
+	finishReason string
+}
+
+// completeStream sends one turn to the API with streaming and returns the assembled result.
+// onToken is called for each text token as it arrives (may be nil for tool-call turns).
+func (c *ChatClient) completeStream(ctx context.Context, messages []ChatMessage, useTools bool, onToken func(string)) (*turnResult, error) {
 	body := map[string]interface{}{
 		"model":    chatModel,
 		"messages": messages,
+		"stream":   true,
 	}
 	if useTools {
 		body["tools"] = toolDefs
@@ -85,24 +105,87 @@ func (c *ChatClient) complete(ctx context.Context, messages []ChatMessage, useTo
 	}
 	defer resp.Body.Close()
 
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("API %s: %s", resp.Status, raw)
 	}
 
-	var cr completionResponse
-	if err := json.Unmarshal(raw, &cr); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
+	var contentBuf strings.Builder
+	partialTCs := map[int]*ToolCall{}
+	finishReason := ""
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if chunk.Error != nil {
+			return nil, fmt.Errorf("API error: %s", chunk.Error.Message)
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		delta := chunk.Choices[0].Delta
+
+		if delta.Content != nil && *delta.Content != "" {
+			contentBuf.WriteString(*delta.Content)
+			if onToken != nil {
+				onToken(*delta.Content)
+			}
+		}
+
+		for _, tc := range delta.ToolCalls {
+			if _, ok := partialTCs[tc.Index]; !ok {
+				partialTCs[tc.Index] = &ToolCall{ID: tc.ID, Type: tc.Type}
+			}
+			p := partialTCs[tc.Index]
+			if tc.ID != "" {
+				p.ID = tc.ID
+			}
+			if tc.Function.Name != "" {
+				p.Function.Name = tc.Function.Name
+			}
+			p.Function.Arguments += tc.Function.Arguments
+		}
+
+		if chunk.Choices[0].FinishReason != nil {
+			finishReason = *chunk.Choices[0].FinishReason
+		}
 	}
-	if cr.Error != nil {
-		return nil, fmt.Errorf("API error: %s", cr.Error.Message)
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("stream read error: %w", err)
 	}
-	return &cr, nil
+
+	toolCalls := make([]ToolCall, 0, len(partialTCs))
+	for i := 0; i < len(partialTCs); i++ {
+		if tc, ok := partialTCs[i]; ok {
+			toolCalls = append(toolCalls, *tc)
+		}
+	}
+
+	return &turnResult{
+		content:      contentBuf.String(),
+		toolCalls:    toolCalls,
+		finishReason: finishReason,
+	}, nil
 }
 
 // RunAgent drives the full agentic loop.
-// onStatus is called for tool call status messages shown in the chat pane.
-// onDone is called with the final text response (or error).
+// onStatus is called for tool-call status lines shown in the chat pane.
+// onToken is called for each streamed text token of the final response.
+// onDone is called when the loop ends; reply contains the full response text (for history).
 // The call is non-blocking — runs in a goroutine.
 func (c *ChatClient) RunAgent(
 	ctx context.Context,
@@ -110,6 +193,7 @@ func (c *ChatClient) RunAgent(
 	history []ChatMessage,
 	executor ToolExecutor,
 	onStatus func(string),
+	onToken func(string),
 	onDone func(string, error),
 ) {
 	go func() {
@@ -120,25 +204,15 @@ func (c *ChatClient) RunAgent(
 		msgs = append(msgs, history...)
 
 		for i := 0; i < maxAgentIterations; i++ {
-			cr, err := c.complete(ctx, msgs, true)
+			result, err := c.completeStream(ctx, msgs, true, onToken)
 			if err != nil {
 				onDone("", err)
 				return
 			}
-			if len(cr.Choices) == 0 {
-				onDone("", fmt.Errorf("empty response from API"))
-				return
-			}
-
-			choice := cr.Choices[0]
 
 			// Final text response
-			if choice.FinishReason == "stop" || len(choice.Message.ToolCalls) == 0 {
-				content := ""
-				if choice.Message.Content != nil {
-					content = *choice.Message.Content
-				}
-				onDone(content, nil)
+			if result.finishReason == "stop" || len(result.toolCalls) == 0 {
+				onDone(result.content, nil)
 				return
 			}
 
@@ -146,22 +220,22 @@ func (c *ChatClient) RunAgent(
 			msgs = append(msgs, ChatMessage{
 				Role:      "assistant",
 				Content:   nil,
-				ToolCalls: choice.Message.ToolCalls,
+				ToolCalls: result.toolCalls,
 			})
 
 			// Execute each tool call
-			for _, tc := range choice.Message.ToolCalls {
+			for _, tc := range result.toolCalls {
 				args := tc.Args()
 				onStatus(fmt.Sprintf("→ %s(%s)", tc.Function.Name, summarizeArgs(args)))
 
-				result, execErr := executeToolCall(ctx, tc, executor)
+				toolResult, execErr := executeToolCall(ctx, tc, executor)
 				if execErr != nil {
-					result = fmt.Sprintf("error: %s", execErr.Error())
+					toolResult = fmt.Sprintf("error: %s", execErr.Error())
 				}
 
 				msgs = append(msgs, ChatMessage{
 					Role:       "tool",
-					Content:    result,
+					Content:    toolResult,
 					ToolCallID: tc.ID,
 					Name:       tc.Function.Name,
 				})
@@ -222,7 +296,6 @@ func executeToolCall(ctx context.Context, tc ToolCall, ex ToolExecutor) (string,
 		case lower == "my issues":
 			ex.NavFilterMyIssues(true)
 		default:
-			// Try project first, then cycle
 			ex.NavToProject(target)
 			ex.NavToCycle(target)
 		}
