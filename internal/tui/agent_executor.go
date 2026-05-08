@@ -177,28 +177,41 @@ func (e *AppExecutor) ExecArchiveIssue(issueIDOrIdentifier string) error {
 
 func (e *AppExecutor) NavToProject(nameOrID string) {
 	e.app.queueUpdateDraw(func() {
-		for _, p := range e.app.teamProjects {
+		lower := strings.ToLower(nameOrID)
+		var best *linearapi.Project
+		for i := range e.app.teamProjects {
+			p := &e.app.teamProjects[i]
+			pLower := strings.ToLower(p.Name)
 			if strings.EqualFold(p.Name, nameOrID) || p.ID == nameOrID {
-				node := &NavigationNode{
-					ID:        p.ID,
-					Text:      p.Name,
-					TeamID:    p.TeamID,
-					IsProject: true,
-				}
-				e.app.onNavigationSelected(node)
-				return
+				best = p
+				break
 			}
+			if best == nil && strings.Contains(pLower, lower) {
+				best = p
+			}
+		}
+		if best != nil {
+			node := &NavigationNode{
+				ID:        best.ID,
+				Text:      best.Name,
+				TeamID:    best.TeamID,
+				IsProject: true,
+			}
+			e.app.onNavigationSelected(node)
 		}
 	})
 }
 
 func (e *AppExecutor) NavToCycle(nameOrID string) {
 	e.app.queueUpdateDraw(func() {
+		lower := strings.ToLower(nameOrID)
 		for _, c := range e.app.cycles {
-			if strings.EqualFold(c.DisplayName(), nameOrID) || c.ID == nameOrID {
+			dn := c.DisplayName()
+			if strings.EqualFold(dn, nameOrID) || c.ID == nameOrID ||
+				strings.Contains(strings.ToLower(dn), lower) {
 				node := &NavigationNode{
 					ID:      c.ID,
-					Text:    c.DisplayName(),
+					Text:    dn,
 					TeamID:  c.TeamID,
 					IsCycle: true,
 					CycleID: c.ID,

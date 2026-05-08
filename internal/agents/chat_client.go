@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 )
 
 const (
@@ -214,13 +215,16 @@ func executeToolCall(ctx context.Context, tc ToolCall, ex ToolExecutor) (string,
 
 	case "navigate":
 		target := str("target")
-		switch target {
-		case "all issues":
+		lower := strings.ToLower(target)
+		switch {
+		case lower == "all issues":
 			ex.NavToAllIssues()
-		case "my issues":
+		case lower == "my issues":
 			ex.NavFilterMyIssues(true)
 		default:
+			// Try project first, then cycle
 			ex.NavToProject(target)
+			ex.NavToCycle(target)
 		}
 		return fmt.Sprintf("Navigated to: %s", target), nil
 
