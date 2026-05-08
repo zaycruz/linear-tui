@@ -117,6 +117,7 @@ type App struct {
 
 	// Cached metadata for currently selected team
 	currentUser    *linearapi.User
+	teams          []linearapi.Team // all teams, populated on nav load
 	teamUsers      []linearapi.User
 	workflowStates []linearapi.WorkflowState
 	teamProjects   []linearapi.Project
@@ -568,6 +569,7 @@ func (a *App) rebuildNavigationTree(teams []linearapi.Team) {
 		root.AddChild(teamNode)
 	}
 
+	a.teams = teams
 	a.navigationTree.SetRoot(root)
 	a.navigationTree.SetCurrentNode(allIssues)
 	a.selectedNavigation = &NavigationNode{ID: "all", Text: "All Issues"}
@@ -847,13 +849,26 @@ func (a *App) bindGlobalKeys() {
 			return a.triageModal.HandleKey(event)
 		}
 
-		// When chat pane is focused, let the input field handle all keys except ? to close
+		// When chat pane is focused, intercept control keys; pass typing through to the input field.
 		if a.focusedPane == FocusChat {
-			if event.Key() == tcell.KeyRune && event.Rune() == '?' {
+			switch event.Key() {
+			case tcell.KeyCtrlC:
+				a.app.Stop()
+				return nil
+			case tcell.KeyEscape:
 				a.toggleChat()
 				return nil
+			case tcell.KeyTab, tcell.KeyBacktab:
+				// Tab out of chat restores previous pane focus
+				a.toggleChat()
+				return nil
+			case tcell.KeyRune:
+				if event.Rune() == '?' {
+					a.toggleChat()
+					return nil
+				}
 			}
-			return event
+			return event // let the input field handle all other typing
 		}
 
 		// Handle palette first if it's open

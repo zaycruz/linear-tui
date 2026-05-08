@@ -176,30 +176,71 @@ func (e *AppExecutor) ExecArchiveIssue(issueIDOrIdentifier string) error {
 // ----- TUI navigation (fire-and-forget) -----
 
 func (e *AppExecutor) NavToProject(nameOrID string) {
-	e.app.queueUpdateDraw(func() {
+	// Run async: may need to fetch projects from API if not yet cached.
+	go func() {
+		ctx := context.Background()
 		lower := strings.ToLower(nameOrID)
+
+		// Helper: score a project name against the query.
+		match := func(name, id string) (bool, bool) {
+			exact := strings.EqualFold(name, nameOrID) || id == nameOrID
+			partial := strings.Contains(strings.ToLower(name), lower)
+			return exact, partial
+		}
+
+		// 1. Search already-loaded teamProjects first (zero-cost).
 		var best *linearapi.Project
 		for i := range e.app.teamProjects {
 			p := &e.app.teamProjects[i]
-			pLower := strings.ToLower(p.Name)
-			if strings.EqualFold(p.Name, nameOrID) || p.ID == nameOrID {
+			exact, partial := match(p.Name, p.ID)
+			if exact {
 				best = p
 				break
 			}
-			if best == nil && strings.Contains(pLower, lower) {
+			if partial && best == nil {
 				best = p
 			}
 		}
-		if best != nil {
+
+		// 2. If not found, search across all known teams via cache.
+		if best == nil {
+			for _, team := range e.app.teams {
+				projects, err := e.app.cache.GetProjects(ctx, team.ID)
+				if err != nil {
+					continue
+				}
+				for i := range projects {
+					p := &projects[i]
+					exact, partial := match(p.Name, p.ID)
+					if exact {
+						best = p
+						break
+					}
+					if partial && best == nil {
+						best = p
+					}
+				}
+				if best != nil && (strings.EqualFold(best.Name, nameOrID) || best.ID == nameOrID) {
+					break // exact match found, stop searching
+				}
+			}
+		}
+
+		if best == nil {
+			return
+		}
+
+		proj := *best
+		e.app.queueUpdateDraw(func() {
 			node := &NavigationNode{
-				ID:        best.ID,
-				Text:      best.Name,
-				TeamID:    best.TeamID,
+				ID:        proj.ID,
+				Text:      proj.Name,
+				TeamID:    proj.TeamID,
 				IsProject: true,
 			}
 			e.app.onNavigationSelected(node)
-		}
-	})
+		})
+	}()
 }
 
 func (e *AppExecutor) NavToCycle(nameOrID string) {
