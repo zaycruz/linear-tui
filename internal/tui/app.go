@@ -79,6 +79,10 @@ type App struct {
 	preChatFocus           FocusTarget
 	pendingSelectNodeID    string // set by agent nav to select a tree node after team expansion
 
+	// Cycle grooming state (active when a cycle is selected)
+	cycleGroomProjIdx int              // index into teamProjects for the backlog browse pane
+	cycleGroomIssues  []linearapi.Issue // non-cycle issues for the current browse project
+
 	// Filter state for assignee / label
 	filterAssigneeMe bool   // when true, filter to current user's issues
 	filterLabelID    string // when set, filter to this label ID
@@ -1040,6 +1044,22 @@ func (a *App) handleIssuesKey(event *tcell.EventKey) *tcell.EventKey {
 			a.updateFocus()
 			return nil
 		}
+		// Cycle grooming shortcuts (active when a cycle is selected)
+		if a.selectedNavigation != nil && a.selectedNavigation.IsCycle {
+			switch r {
+			case '[':
+				a.cyclePrevGroomProject()
+				return nil
+			case ']':
+				a.cycleNextGroomProject()
+				return nil
+			case 'a':
+				if a.activeIssuesSection == IssuesSectionOther {
+					a.addSelectedIssueToCycle()
+					return nil
+				}
+			}
+		}
 		// Handle Shift+A: toggle "filter to my issues"
 		if r == 'A' {
 			a.toggleFilterAssigneeMe()
@@ -1435,6 +1455,109 @@ HOW TO BEHAVE:
 	return sb.String()
 }
 
+// refreshCycleGroomIssues fetches non-cycle issues for the current browse project
+// and populates cycleGroomIssues. Safe to call from any goroutine.
+func (a *App) refreshCycleGroomIssues() {
+	if a.selectedNavigation == nil || !a.selectedNavigation.IsCycle {
+		return
+	}
+	if len(a.teamProjects) == 0 {
+		return
+	}
+	idx := a.cycleGroomProjIdx % len(a.teamProjects)
+	proj := a.teamProjects[idx]
+
+	ctx := context.Background()
+	page, err := a.api.FetchIssuesPage(ctx, linearapi.FetchIssuesParams{
+		TeamID:    proj.TeamID,
+		ProjectID: proj.ID,
+	}, nil)
+	if err != nil {
+		return
+	}
+
+	// Build set of issue IDs already in the cycle
+	a.issuesMu.RLock()
+	inCycle := make(map[string]bool, len(a.issues))
+	for _, iss := range a.issues {
+		inCycle[iss.ID] = true
+	}
+	a.issuesMu.RUnlock()
+
+	filtered := make([]linearapi.Issue, 0, len(page.Issues))
+	for _, iss := range page.Issues {
+		if !inCycle[iss.ID] {
+			filtered = append(filtered, iss)
+		}
+	}
+
+	a.app.QueueUpdateDraw(func() {
+		a.cycleGroomIssues = filtered
+		// Rebuild only the other issues table
+		projectNames := make(map[string]string)
+		for _, p := range a.teamProjects {
+			projectNames[p.ID] = p.Name
+		}
+		a.otherIssueRows, a.otherIDToIssue = BuildIssueRowsGroupedByProject(filtered, a.expandedState, projectNames)
+		renderIssuesTableModel(a.otherIssuesTable, a.otherIssueRows, a.otherIDToIssue, "", a.theme)
+		// Update title with project name
+		a.otherIssuesTable.SetTitle(fmt.Sprintf(" Backlog: %s  [darkgray][ ] browse  a: add to cycle[-] ", proj.Name))
+	})
+}
+
+// cyclePrevGroomProject switches the backlog browse pane to the previous project.
+func (a *App) cyclePrevGroomProject() {
+	if len(a.teamProjects) == 0 {
+		return
+	}
+	a.cycleGroomProjIdx = (a.cycleGroomProjIdx - 1 + len(a.teamProjects)) % len(a.teamProjects)
+	go a.refreshCycleGroomIssues()
+}
+
+// cycleNextGroomProject switches the backlog browse pane to the next project.
+func (a *App) cycleNextGroomProject() {
+	if len(a.teamProjects) == 0 {
+		return
+	}
+	a.cycleGroomProjIdx = (a.cycleGroomProjIdx + 1) % len(a.teamProjects)
+	go a.refreshCycleGroomIssues()
+}
+
+// addSelectedIssueToCycle adds the currently selected "Other Issues" row to the active cycle.
+func (a *App) addSelectedIssueToCycle() {
+	if a.selectedNavigation == nil || !a.selectedNavigation.IsCycle {
+		return
+	}
+	cycleID := a.selectedNavigation.CycleID
+	if cycleID == "" {
+		return
+	}
+	issue := a.getIssueFromRowForSection(
+		func() int { r, _ := a.otherIssuesTable.GetSelection(); return r }(),
+		IssuesSectionOther,
+	)
+	if issue == nil {
+		return
+	}
+	issueID := issue.ID
+	identifier := issue.Identifier
+	go func() {
+		ctx := context.Background()
+		if err := a.api.AddIssueToCycle(ctx, issueID, cycleID); err != nil {
+			a.app.QueueUpdateDraw(func() {
+				a.updateStatusBarWithError(err)
+			})
+			return
+		}
+		a.app.QueueUpdateDraw(func() {
+			a.statusBar.SetText(fmt.Sprintf("%sAdded %s to cycle[-]", a.themeTags.Accent, identifier))
+		})
+		// Refresh both panes so the issue moves from backlog → cycle
+		go a.refreshIssues()
+		go a.refreshCycleGroomIssues()
+	}()
+}
+
 // openCycleKanban opens the kanban modal for the current cycle.
 // Safe to call from anywhere (checks nil and non-cycle navigation).
 func (a *App) openCycleKanban() {
@@ -1824,6 +1947,18 @@ func (a *App) updateIssuesColumnLayout() {
 	// Always add Other Issues table
 	a.issuesColumn.AddItem(a.otherIssuesTable, 0, 1, false)
 
+	// In cycle view, label the Other Issues section with the browse project and hint
+	if inCycleView {
+		projName := "Backlog"
+		if len(a.teamProjects) > 0 {
+			idx := a.cycleGroomProjIdx % len(a.teamProjects)
+			projName = a.teamProjects[idx].Name
+		}
+		a.otherIssuesTable.SetTitle(fmt.Sprintf(" Backlog: %s  [darkgray][ ] browse  a: add to cycle[-] ", projName))
+	} else {
+		a.otherIssuesTable.SetTitle(" Other Issues ")
+	}
+
 	// Update all pane titles to reflect current state
 	a.updateAllPaneTitles()
 }
@@ -1904,7 +2039,8 @@ func (a *App) rebuildIssuesTables(targetIssueID string) *linearapi.Issue {
 			projectNames[p.ID] = p.Name
 		}
 		a.myIssueRows, a.myIDToIssue = BuildIssueRowsGroupedByProject(myIssues, a.expandedState, projectNames)
-		a.otherIssueRows, a.otherIDToIssue = BuildIssueRowsGroupedByProject(otherIssues, a.expandedState, projectNames)
+		// Other section shows non-cycle backlog issues for browsing/grooming
+		a.otherIssueRows, a.otherIDToIssue = BuildIssueRowsGroupedByProject(a.cycleGroomIssues, a.expandedState, projectNames)
 	} else {
 		// Build hierarchical tree rows for each section.
 		a.myIssueRows, a.myIDToIssue = BuildIssueRows(myIssues, a.expandedState)
@@ -2229,11 +2365,18 @@ func (a *App) onNavigationSelected(node *NavigationNode) {
 				}
 				a.updateBurndownPanel()
 				a.updateStatusBar()
+				// Kick off cycle grooming backlog for the first project
+				if node.IsCycle {
+					a.cycleGroomProjIdx = 0
+					a.cycleGroomIssues = nil
+					go a.refreshCycleGroomIssues()
+				}
 			})
 		}()
 	} else {
-		// "All Issues" or team-level: clear selectedCycle
+		// "All Issues" or team-level: clear selectedCycle and groom state
 		a.selectedCycle = nil
+		a.cycleGroomIssues = nil
 	}
 
 	// Refresh issues for the new selection - run in goroutine to avoid blocking
