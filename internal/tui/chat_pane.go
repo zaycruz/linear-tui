@@ -75,24 +75,14 @@ func (c *ChatPane) addUser(text string) {
 	c.history.ScrollToEnd()
 }
 
-func (c *ChatPane) startAssistant() {
+func (c *ChatPane) addAssistant(text string) {
 	if c.buf.Len() > 0 {
 		c.buf.WriteString("\n")
 	}
 	c.buf.WriteString("[cyan]AI:[white]  ")
+	c.buf.WriteString(tview.Escape(text))
 	c.history.SetText(c.buf.String())
 	c.history.ScrollToEnd()
-}
-
-func (c *ChatPane) appendToken(token string) {
-	c.buf.WriteString(tview.Escape(token))
-	c.history.SetText(c.buf.String())
-	c.history.ScrollToEnd()
-}
-
-func (c *ChatPane) finalizeAssistant(full string) {
-	// Token streaming already wrote the content; just mark not busy.
-	_ = full
 	c.Busy = false
 }
 

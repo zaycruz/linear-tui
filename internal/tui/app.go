@@ -1399,26 +1399,26 @@ func (a *App) handleChatSubmit(text string) {
 	a.chatHistory = append(a.chatHistory, agents.ChatMessage{Role: "user", Content: text})
 
 	system := a.buildChatSystemPrompt()
+	executor := &AppExecutor{app: a}
 
-	a.chatPane.startAssistant()
-
-	a.chatClient.Stream(
+	a.chatClient.RunAgent(
 		context.Background(),
 		system,
 		a.chatHistory,
-		func(token string) {
+		executor,
+		func(status string) {
 			a.queueUpdateDraw(func() {
-				a.chatPane.appendToken(token)
+				a.chatPane.setStatus(status)
 			})
 		},
-		func(full string, err error) {
+		func(reply string, err error) {
 			a.queueUpdateDraw(func() {
 				if err != nil {
 					a.chatPane.addError(err.Error())
 					return
 				}
-				a.chatHistory = append(a.chatHistory, agents.ChatMessage{Role: "assistant", Content: full})
-				a.chatPane.finalizeAssistant(full)
+				a.chatHistory = append(a.chatHistory, agents.ChatMessage{Role: "assistant", Content: reply})
+				a.chatPane.addAssistant(reply)
 			})
 		},
 	)
