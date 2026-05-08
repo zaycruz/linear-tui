@@ -239,6 +239,7 @@ func (e *AppExecutor) NavToProject(nameOrID string) {
 				IsProject: true,
 			}
 			e.app.onNavigationSelected(node)
+			e.app.selectNavNode(proj.TeamID, proj.ID)
 		})
 	}()
 }
@@ -258,6 +259,7 @@ func (e *AppExecutor) NavToCycle(nameOrID string) {
 					CycleID: c.ID,
 				}
 				e.app.onNavigationSelected(node)
+				e.app.selectNavNode(c.TeamID, c.ID)
 				return
 			}
 		}

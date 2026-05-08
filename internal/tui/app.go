@@ -76,6 +76,7 @@ type App struct {
 	chatVisible            bool
 	chatHistory            []agents.ChatMessage
 	preChatFocus           FocusTarget
+	pendingSelectNodeID    string // set by agent nav to select a tree node after team expansion
 
 	// Filter state for assignee / label
 	filterAssigneeMe bool   // when true, filter to current user's issues
@@ -701,6 +702,13 @@ func (a *App) onTeamExpanded(teamID string, teamNode *tview.TreeNode) {
 				teamNode.AddChild(cyclesGroup)
 			}
 			teamNode.SetExpanded(true)
+			// Resolve any pending agent-nav selection
+			if a.pendingSelectNodeID != "" {
+				if sel := a.findTreeNode(a.pendingSelectNodeID); sel != nil {
+					a.navigationTree.SetCurrentNode(sel)
+					a.pendingSelectNodeID = ""
+				}
+			}
 		})
 	}()
 }
@@ -2074,6 +2082,46 @@ func (a *App) toggleIssueExpanded(issueID string) {
 
 	renderIssuesTableModel(a.myIssuesTable, a.myIssueRows, a.myIDToIssue, selectedMyIssueID, a.theme)
 	renderIssuesTableModel(a.otherIssuesTable, a.otherIssueRows, a.otherIDToIssue, selectedOtherIssueID, a.theme)
+}
+
+// findTreeNode walks the navigation tree and returns the node whose NavigationNode.ID matches id.
+func (a *App) findTreeNode(id string) *tview.TreeNode {
+	root := a.navigationTree.GetRoot()
+	if root == nil {
+		return nil
+	}
+	var found *tview.TreeNode
+	var walk func(*tview.TreeNode)
+	walk = func(n *tview.TreeNode) {
+		if found != nil {
+			return
+		}
+		if ref, ok := n.GetReference().(*NavigationNode); ok && ref != nil && ref.ID == id {
+			found = n
+			return
+		}
+		for _, child := range n.GetChildren() {
+			walk(child)
+		}
+	}
+	walk(root)
+	return found
+}
+
+// selectNavNode moves the tree cursor to the given nodeID.
+// If the node isn't in the tree yet (team collapsed), it expands the team and defers selection.
+// Must be called from the main tview goroutine (inside QueueUpdateDraw or equivalent).
+func (a *App) selectNavNode(teamID, nodeID string) {
+	if node := a.findTreeNode(nodeID); node != nil {
+		a.navigationTree.SetCurrentNode(node)
+		return
+	}
+	teamNode := a.findTreeNode(teamID)
+	if teamNode == nil {
+		return
+	}
+	a.pendingSelectNodeID = nodeID
+	a.onTeamExpanded(teamID, teamNode)
 }
 
 // onNavigationSelected handles when a navigation item is selected.
