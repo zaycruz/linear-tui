@@ -44,6 +44,7 @@ type App struct {
 	myIssuesTable          *tview.Table
 	otherIssuesTable       *tview.Table
 	issuesColumn           *tview.Flex     // Vertical flex containing My/Other tables
+	burndownPanel          *tview.TextView // Cycle burndown bar (shown in cycle view)
 	detailsView            *tview.Flex     // Flex container for details (description + comments)
 	detailsDescriptionView *tview.TextView // Scrollable description/metadata view
 	detailsCommentsView    *tview.TextView // Scrollable comments view
@@ -641,6 +642,8 @@ func (a *App) buildLayout() {
 	// Build My Issues and Other Issues tables
 	a.myIssuesTable = a.buildIssuesTable(" My Issues ", IssuesSectionMy)
 	a.otherIssuesTable = a.buildIssuesTable(" Other Issues ", IssuesSectionOther)
+	// Build the cycle burndown panel (hidden until a cycle is selected)
+	a.burndownPanel = buildBurndownPanel(a, nil)
 	// Create vertical flex for issues column
 	a.issuesColumn = tview.NewFlex().SetDirection(tview.FlexRow)
 	// Initially show only Other Issues table (My Issues will be added when issues are loaded)
@@ -1379,9 +1382,17 @@ func (a *App) refreshIssuesWithFocusChange(allowFocusChange bool, issueID ...str
 	})
 }
 
-// updateIssuesColumnLayout updates the issues column flex to show/hide My Issues table.
+// updateIssuesColumnLayout updates the issues column flex to show/hide My Issues table
+// and the cycle burndown panel.
 func (a *App) updateIssuesColumnLayout() {
 	a.issuesColumn.Clear()
+
+	// Show burndown panel when in cycle view
+	inCycleView := a.selectedNavigation != nil && a.selectedNavigation.IsCycle
+	if inCycleView && a.burndownPanel != nil {
+		a.updateBurndownPanel()
+		a.issuesColumn.AddItem(a.burndownPanel, 3, 0, false)
+	}
 
 	// Add My Issues table if there are any
 	if len(a.myIssueRows) > 0 {
@@ -1393,6 +1404,21 @@ func (a *App) updateIssuesColumnLayout() {
 
 	// Update all pane titles to reflect current state
 	a.updateAllPaneTitles()
+}
+
+// updateBurndownPanel refreshes the burndown panel content from the selected cycle.
+func (a *App) updateBurndownPanel() {
+	if a.burndownPanel == nil {
+		return
+	}
+	if a.selectedCycle != nil {
+		text := buildCycleBurndownText(a.selectedCycle, 20)
+		a.burndownPanel.SetText(text)
+		a.burndownPanel.SetTitle(" Cycle Burndown ")
+	} else {
+		a.burndownPanel.SetText("")
+		a.burndownPanel.SetTitle(" Cycle Burndown ")
+	}
 }
 
 // updateIssuesData updates the UI with new issues data.
@@ -1713,6 +1739,7 @@ func (a *App) onNavigationSelected(node *NavigationNode) {
 				} else {
 					a.selectedCycle = nil
 				}
+				a.updateBurndownPanel()
 				a.updateStatusBar()
 			})
 		}()

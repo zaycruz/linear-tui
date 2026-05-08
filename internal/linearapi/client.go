@@ -186,25 +186,26 @@ type Comment struct {
 
 // Issue represents a Linear issue.
 type Issue struct {
-	ID          string
-	Identifier  string
-	Title       string
-	Description string
-	State       string
-	StateID     string
-	Assignee    string
-	AssigneeID  string
-	Priority    int
-	UpdatedAt   time.Time
-	CreatedAt   time.Time
-	TeamID      string
-	ProjectID   string
-	URL         string
-	Archived    bool
-	Labels      []IssueLabel
-	Parent      *IssueRef       // Parent issue reference (nil if top-level)
-	Children    []IssueChildRef // Child/sub-issue references
-	Comments    []Comment       // Comments on this issue
+	ID            string
+	Identifier    string
+	Title         string
+	Description   string
+	State         string
+	StateID       string
+	Assignee      string
+	AssigneeID    string
+	Priority      int
+	UpdatedAt     time.Time
+	CreatedAt     time.Time
+	TeamID        string
+	ProjectID     string
+	URL           string
+	Archived      bool
+	Labels        []IssueLabel
+	Parent        *IssueRef       // Parent issue reference (nil if top-level)
+	Children      []IssueChildRef // Child/sub-issue references
+	Comments      []Comment       // Comments on this issue
+	GitBranchName string          // Linear-generated git branch name
 }
 
 // IssueFetchProgress describes progress for a paginated issue fetch.
@@ -673,6 +674,7 @@ func (c *Client) searchIssuesPage(ctx context.Context, params FetchIssuesParams,
 				}
 				URL        graphql.String
 				ArchivedAt *graphql.String
+				BranchName graphql.String
 				Parent     *struct {
 					ID         graphql.String
 					Identifier graphql.String
@@ -830,6 +832,7 @@ func (c *Client) fetchIssuesWithFilterPage(ctx context.Context, params FetchIssu
 				}
 				URL        graphql.String
 				ArchivedAt *graphql.String
+				BranchName graphql.String
 				Parent     *struct {
 					ID         graphql.String
 					Identifier graphql.String
@@ -930,6 +933,11 @@ func (c *Client) parseIssueNode(node interface{}) Issue {
 
 	url := v.FieldByName("URL").String()
 
+	gitBranchName := ""
+	if branchField := v.FieldByName("BranchName"); branchField.IsValid() {
+		gitBranchName = branchField.String()
+	}
+
 	archivedField := v.FieldByName("ArchivedAt")
 	archived := !archivedField.IsNil()
 
@@ -971,24 +979,25 @@ func (c *Client) parseIssueNode(node interface{}) Issue {
 	}
 
 	return Issue{
-		ID:          id,
-		Identifier:  identifier,
-		Title:       title,
-		State:       stateName,
-		StateID:     stateID,
-		Assignee:    assignee,
-		AssigneeID:  assigneeID,
-		Priority:    priority,
-		UpdatedAt:   updatedAt,
-		CreatedAt:   createdAt,
-		Description: description,
-		TeamID:      teamID,
-		ProjectID:   projectID,
-		URL:         url,
-		Archived:    archived,
-		Labels:      labels,
-		Parent:      parent,
-		Children:    children,
+		ID:            id,
+		Identifier:    identifier,
+		Title:         title,
+		State:         stateName,
+		StateID:       stateID,
+		Assignee:      assignee,
+		AssigneeID:    assigneeID,
+		Priority:      priority,
+		UpdatedAt:     updatedAt,
+		CreatedAt:     createdAt,
+		Description:   description,
+		TeamID:        teamID,
+		ProjectID:     projectID,
+		URL:           url,
+		Archived:      archived,
+		Labels:        labels,
+		Parent:        parent,
+		Children:      children,
+		GitBranchName: gitBranchName,
 	}
 }
 
@@ -1043,6 +1052,7 @@ func (c *Client) FetchIssueByID(ctx context.Context, id string) (Issue, error) {
 			}
 			URL        graphql.String
 			ArchivedAt *graphql.String
+			BranchName graphql.String
 			Parent     *struct {
 				ID         graphql.String
 				Identifier graphql.String
@@ -1163,25 +1173,26 @@ func (c *Client) FetchIssueByID(ctx context.Context, id string) (Issue, error) {
 	}
 
 	return Issue{
-		ID:          string(query.Issue.ID),
-		Identifier:  string(query.Issue.Identifier),
-		Title:       string(query.Issue.Title),
-		State:       string(query.Issue.State.Name),
-		StateID:     string(query.Issue.State.ID),
-		Assignee:    assignee,
-		AssigneeID:  assigneeID,
-		Priority:    int(query.Issue.Priority),
-		UpdatedAt:   updatedAt,
-		CreatedAt:   createdAt,
-		Description: description,
-		TeamID:      string(query.Issue.Team.ID),
-		ProjectID:   projectID,
-		URL:         string(query.Issue.URL),
-		Archived:    archived,
-		Labels:      labels,
-		Parent:      parent,
-		Children:    children,
-		Comments:    comments,
+		ID:            string(query.Issue.ID),
+		Identifier:    string(query.Issue.Identifier),
+		Title:         string(query.Issue.Title),
+		State:         string(query.Issue.State.Name),
+		StateID:       string(query.Issue.State.ID),
+		Assignee:      assignee,
+		AssigneeID:    assigneeID,
+		Priority:      int(query.Issue.Priority),
+		UpdatedAt:     updatedAt,
+		CreatedAt:     createdAt,
+		Description:   description,
+		TeamID:        string(query.Issue.Team.ID),
+		ProjectID:     projectID,
+		URL:           string(query.Issue.URL),
+		Archived:      archived,
+		Labels:        labels,
+		Parent:        parent,
+		Children:      children,
+		Comments:      comments,
+		GitBranchName: string(query.Issue.BranchName),
 	}, nil
 }
 

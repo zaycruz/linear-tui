@@ -430,13 +430,46 @@ func DefaultCommands(app *App) []Command {
 			ID:           "edit_labels",
 			Title:        "Edit issue labels",
 			Keywords:     []string{"labels", "label", "tag", "tags"},
-			ShortcutRune: 'g', // 'g' for tags (since 'l' is used for vim navigation)
+			ShortcutRune: 'f', // 'f' for flags/labels
 			Run: func(a *App) {
 				issue := a.GetSelectedIssue()
 				if issue == nil {
 					return
 				}
 				a.ShowEditLabelsModal()
+			},
+		},
+		{
+			ID:           "git_checkout",
+			Title:        "Checkout git branch",
+			Keywords:     []string{"git", "checkout", "branch", "g"},
+			ShortcutRune: 'g',
+			Run: func(a *App) {
+				issue := a.GetSelectedIssue()
+				if issue == nil {
+					return
+				}
+				workspace := strings.TrimSpace(a.config.AgentWorkspace)
+				if workspace == "" {
+					a.updateStatusBarWithError(fmt.Errorf("agent_workspace not configured in ~/.linear-tui/config.json"))
+					return
+				}
+				branchName := strings.TrimSpace(issue.GitBranchName)
+				if branchName == "" {
+					branchName = slugifyBranchName(issue.Identifier, issue.Title)
+				}
+				go func() {
+					err := checkoutGitBranch(branchName, workspace)
+					a.QueueUpdateDraw(func() {
+						if err != nil {
+							logger.ErrorWithErr(err, "tui.commands: git checkout failed branch=%s workspace=%s", branchName, workspace)
+							a.updateStatusBarWithError(fmt.Errorf("git checkout -b %s: %v", branchName, err))
+							return
+						}
+						logger.Info("tui.commands: git checkout succeeded branch=%s", branchName)
+						a.statusBar.SetText(fmt.Sprintf("%sBranch checked out: %s[-]", a.themeTags.Accent, branchName))
+					})
+				}()
 			},
 		},
 		{
@@ -768,6 +801,43 @@ func openURL(url string) error {
 
 	logger.Debug("tui.commands: opened URL in browser url=%s", url)
 	return nil
+}
+
+// checkoutGitBranch runs `git checkout -b <branchName>` in workspace.
+func checkoutGitBranch(branchName, workspace string) error {
+	cmd := exec.Command("git", "checkout", "-b", branchName)
+	cmd.Dir = workspace
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// slugifyBranchName produces a safe git branch name from an issue identifier and title.
+// Format: <identifier>-<slug> where slug replaces non-alphanumeric chars with '-'
+// and the whole result is truncated to 50 characters.
+func slugifyBranchName(identifier, title string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(identifier + "-" + title) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	result := b.String()
+	// Collapse multiple consecutive dashes
+	for strings.Contains(result, "--") {
+		result = strings.ReplaceAll(result, "--", "-")
+	}
+	// Trim leading/trailing dashes
+	result = strings.Trim(result, "-")
+	if len(result) > 50 {
+		result = result[:50]
+		result = strings.TrimRight(result, "-")
+	}
+	return result
 }
 
 // copyToClipboard copies text to the system clipboard.
