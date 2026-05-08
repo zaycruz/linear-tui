@@ -275,13 +275,11 @@ func (a *App) setupIssuesTableNavigation(table *tview.Table, section IssuesSecti
 				}
 				return nil
 			case ' ':
-				// Space toggles expand/collapse
+				// Space toggles bulk selection for the focused issue
 				row, _ := table.GetSelection()
 				if issue := a.getIssueFromRowForSection(row, section); issue != nil {
-					if len(issue.Children) > 0 {
-						a.toggleIssueExpanded(issue.ID)
-						a.activeIssuesSection = section
-					}
+					a.ToggleBulkSelect(issue.ID)
+					a.activeIssuesSection = section
 				}
 				return nil
 			}
@@ -374,7 +372,12 @@ func (a *App) getRowForIssueInSection(issueID string, section IssuesSection) int
 }
 
 // renderIssuesTableModel renders a table with the given rows and issue lookup map.
-func renderIssuesTableModel(table *tview.Table, rows []IssueRow, idToIssue map[string]*linearapi.Issue, selectedIssueID string, theme Theme) {
+// selectedIDs is an optional map of issue IDs that are bulk-selected (shown with ✓ prefix).
+func renderIssuesTableModel(table *tview.Table, rows []IssueRow, idToIssue map[string]*linearapi.Issue, selectedIssueID string, theme Theme, selectedIDs ...map[string]bool) {
+	var bulkSelected map[string]bool
+	if len(selectedIDs) > 0 {
+		bulkSelected = selectedIDs[0]
+	}
 	table.Clear()
 
 	// Set column headers with better styling
@@ -448,8 +451,16 @@ func renderIssuesTableModel(table *tview.Table, rows []IssueRow, idToIssue map[s
 			}
 		}
 
-		table.SetCell(row, 0, tview.NewTableCell(identifierPrefix+identifier).
-			SetTextColor(theme.SecondaryText).
+		// Show bulk selection indicator
+		idCellText := identifierPrefix + identifier
+		idCellColor := theme.SecondaryText
+		if bulkSelected != nil && bulkSelected[issue.ID] {
+			idCellText = "✓ " + identifier
+			idCellColor = theme.Accent
+		}
+
+		table.SetCell(row, 0, tview.NewTableCell(idCellText).
+			SetTextColor(idCellColor).
 			SetAlign(tview.AlignLeft))
 
 		// State with color based on state

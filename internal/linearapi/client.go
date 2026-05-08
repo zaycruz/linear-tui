@@ -184,6 +184,62 @@ type Comment struct {
 	IssueID   string
 }
 
+// IssueAttachment represents an attachment on a Linear issue (e.g. GitHub PR link).
+type IssueAttachment struct {
+	ID         string
+	Title      string
+	URL        string
+	SourceType string // e.g. "github"
+}
+
+// IssueRelation represents a relation between two Linear issues.
+type IssueRelation struct {
+	ID           string
+	Type         string // "blocks", "blocked", "duplicate", "duplicateOf", "related"
+	RelatedIssue IssueRef
+	RelatedState string
+}
+
+// Notification represents a Linear notification.
+type Notification struct {
+	ID              string
+	Type            string // "issueAssigned", "issueMention", etc.
+	ReadAt          string // empty if unread
+	IssueID         string
+	IssueIdentifier string
+	IssueTitle      string
+	IssueState      string
+	CommentBody     string
+	ActorName       string
+	CreatedAt       string
+}
+
+// IssueRelationCreateInput is a custom scalar type for Linear's IssueRelationCreateInput.
+type IssueRelationCreateInput map[string]interface{}
+
+// GetGraphQLType returns the GraphQL type name.
+func (IssueRelationCreateInput) GetGraphQLType() string {
+	return "IssueRelationCreateInput"
+}
+
+// MarshalJSON implements json.Marshaler for IssueRelationCreateInput.
+func (i IssueRelationCreateInput) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}(i))
+}
+
+// NotificationUpdateInput is a custom scalar type for Linear's NotificationUpdateInput.
+type NotificationUpdateInput map[string]interface{}
+
+// GetGraphQLType returns the GraphQL type name.
+func (NotificationUpdateInput) GetGraphQLType() string {
+	return "NotificationUpdateInput"
+}
+
+// MarshalJSON implements json.Marshaler for NotificationUpdateInput.
+func (i NotificationUpdateInput) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}(i))
+}
+
 // Issue represents a Linear issue.
 type Issue struct {
 	ID            string
@@ -195,6 +251,8 @@ type Issue struct {
 	Assignee      string
 	AssigneeID    string
 	Priority      int
+	Estimate      *float64        // Story point estimate (nil if not set)
+	DueDate       string          // Due date in YYYY-MM-DD format (empty if not set)
 	UpdatedAt     time.Time
 	CreatedAt     time.Time
 	TeamID        string
@@ -202,10 +260,12 @@ type Issue struct {
 	URL           string
 	Archived      bool
 	Labels        []IssueLabel
-	Parent        *IssueRef       // Parent issue reference (nil if top-level)
-	Children      []IssueChildRef // Child/sub-issue references
-	Comments      []Comment       // Comments on this issue
-	GitBranchName string          // Linear-generated git branch name
+	Parent        *IssueRef        // Parent issue reference (nil if top-level)
+	Children      []IssueChildRef  // Child/sub-issue references
+	Comments      []Comment        // Comments on this issue
+	GitBranchName string           // Linear-generated git branch name
+	Attachments   []IssueAttachment // GitHub PR links and other attachments
+	Relations     []IssueRelation   // Issue relations (blocks/blocked/duplicate/related)
 }
 
 // IssueFetchProgress describes progress for a paginated issue fetch.
@@ -256,6 +316,8 @@ type UpdateIssueInput struct {
 	StateID     *string
 	AssigneeID  *string
 	Priority    *int
+	Estimate    *float64  // nil = no change, set to update estimate
+	DueDate     *string   // nil = no change, empty string = clear, "YYYY-MM-DD" to set
 	LabelIDs    *[]string // nil = no change, empty slice = clear all, non-empty = set labels
 	ParentID    *string   // nil = no change, empty string = clear parent, non-empty = set parent
 }
@@ -1034,6 +1096,8 @@ func (c *Client) FetchIssueByID(ctx context.Context, id string) (Issue, error) {
 				Name graphql.String
 			}
 			Priority    graphql.Float
+			Estimate    *graphql.Float
+			DueDate     *graphql.String
 			UpdatedAt   graphql.String
 			CreatedAt   graphql.String
 			Description *graphql.String
@@ -1084,6 +1148,28 @@ func (c *Client) FetchIssueByID(ctx context.Context, id string) (Issue, error) {
 					}
 				}
 			} `graphql:"comments(first: 100, orderBy: createdAt)"`
+			Attachments struct {
+				Nodes []struct {
+					ID         graphql.String
+					Title      graphql.String
+					URL        graphql.String
+					SourceType graphql.String
+				}
+			}
+			Relations struct {
+				Nodes []struct {
+					ID   graphql.String
+					Type graphql.String
+					RelatedIssue struct {
+						ID         graphql.String
+						Identifier graphql.String
+						Title      graphql.String
+						State      struct {
+							Name graphql.String
+						}
+					}
+				}
+			}
 		} `graphql:"issue(id: $id)"`
 	}
 
@@ -1172,6 +1258,45 @@ func (c *Client) FetchIssueByID(ctx context.Context, id string) (Issue, error) {
 		})
 	}
 
+	// Parse estimate
+	var estimate *float64
+	if query.Issue.Estimate != nil {
+		v := float64(*query.Issue.Estimate)
+		estimate = &v
+	}
+
+	// Parse due date
+	dueDate := ""
+	if query.Issue.DueDate != nil {
+		dueDate = string(*query.Issue.DueDate)
+	}
+
+	// Parse attachments
+	attachments := make([]IssueAttachment, 0, len(query.Issue.Attachments.Nodes))
+	for _, att := range query.Issue.Attachments.Nodes {
+		attachments = append(attachments, IssueAttachment{
+			ID:         string(att.ID),
+			Title:      string(att.Title),
+			URL:        string(att.URL),
+			SourceType: string(att.SourceType),
+		})
+	}
+
+	// Parse relations
+	relations := make([]IssueRelation, 0, len(query.Issue.Relations.Nodes))
+	for _, rel := range query.Issue.Relations.Nodes {
+		relations = append(relations, IssueRelation{
+			ID:   string(rel.ID),
+			Type: string(rel.Type),
+			RelatedIssue: IssueRef{
+				ID:         string(rel.RelatedIssue.ID),
+				Identifier: string(rel.RelatedIssue.Identifier),
+				Title:      string(rel.RelatedIssue.Title),
+			},
+			RelatedState: string(rel.RelatedIssue.State.Name),
+		})
+	}
+
 	return Issue{
 		ID:            string(query.Issue.ID),
 		Identifier:    string(query.Issue.Identifier),
@@ -1181,6 +1306,8 @@ func (c *Client) FetchIssueByID(ctx context.Context, id string) (Issue, error) {
 		Assignee:      assignee,
 		AssigneeID:    assigneeID,
 		Priority:      int(query.Issue.Priority),
+		Estimate:      estimate,
+		DueDate:       dueDate,
 		UpdatedAt:     updatedAt,
 		CreatedAt:     createdAt,
 		Description:   description,
@@ -1193,6 +1320,8 @@ func (c *Client) FetchIssueByID(ctx context.Context, id string) (Issue, error) {
 		Children:      children,
 		Comments:      comments,
 		GitBranchName: string(query.Issue.BranchName),
+		Attachments:   attachments,
+		Relations:     relations,
 	}, nil
 }
 
@@ -1391,6 +1520,16 @@ func (c *Client) UpdateIssue(ctx context.Context, input UpdateIssueInput) (Issue
 			labelIDs[i] = graphql.ID(id)
 		}
 		issueInput["labelIds"] = labelIDs
+	}
+	if input.Estimate != nil {
+		issueInput["estimate"] = graphql.Float(*input.Estimate)
+	}
+	if input.DueDate != nil {
+		if *input.DueDate == "" {
+			issueInput["dueDate"] = (*graphql.String)(nil)
+		} else {
+			issueInput["dueDate"] = graphql.String(*input.DueDate)
+		}
 	}
 	if input.ParentID != nil {
 		if *input.ParentID == "" {
@@ -1680,4 +1819,126 @@ func (c *Client) ListIssueLabels(ctx context.Context, teamID string) ([]IssueLab
 	})
 
 	return labels, nil
+}
+
+// CreateIssueRelation creates a relation between two issues.
+func (c *Client) CreateIssueRelation(ctx context.Context, issueID, relatedIssueID, relationType string) error {
+	var mutation struct {
+		IssueRelationCreate struct {
+			Success graphql.Boolean
+		} `graphql:"issueRelationCreate(input: $input)"`
+	}
+
+	input := IssueRelationCreateInput{
+		"issueId":        graphql.ID(issueID),
+		"relatedIssueId": graphql.ID(relatedIssueID),
+		"type":           graphql.String(relationType),
+	}
+
+	variables := map[string]interface{}{
+		"input": input,
+	}
+
+	if err := c.client.Mutate(ctx, &mutation, variables); err != nil {
+		logger.ErrorWithErr(err, "linearapi.client: CreateIssueRelation failed issue_id=%s related_id=%s type=%s", issueID, relatedIssueID, relationType)
+		return fmt.Errorf("create issue relation: %w", err)
+	}
+
+	if !bool(mutation.IssueRelationCreate.Success) {
+		logger.Error("linearapi.client: CreateIssueRelation operation failed success=false")
+		return fmt.Errorf("create issue relation: operation failed")
+	}
+
+	return nil
+}
+
+// FetchNotifications fetches recent notifications for the current user.
+func (c *Client) FetchNotifications(ctx context.Context) ([]Notification, error) {
+	var query struct {
+		Notifications struct {
+			Nodes []struct {
+				ID     graphql.String
+				Type   graphql.String
+				ReadAt *graphql.String
+				Issue  *struct {
+					ID         graphql.String
+					Identifier graphql.String
+					Title      graphql.String
+					State      struct {
+						Name graphql.String
+					}
+				}
+				Comment *struct {
+					Body graphql.String
+				}
+				Actor *struct {
+					Name graphql.String
+				}
+				CreatedAt graphql.String
+			}
+		} `graphql:"notifications(first: 50)"`
+	}
+
+	if err := c.client.Query(ctx, &query, nil); err != nil {
+		logger.ErrorWithErr(err, "linearapi.client: FetchNotifications failed")
+		return nil, fmt.Errorf("fetch notifications: %w", err)
+	}
+
+	notifications := make([]Notification, 0, len(query.Notifications.Nodes))
+	for _, node := range query.Notifications.Nodes {
+		n := Notification{
+			ID:        string(node.ID),
+			Type:      string(node.Type),
+			CreatedAt: string(node.CreatedAt),
+		}
+		if node.ReadAt != nil {
+			n.ReadAt = string(*node.ReadAt)
+		}
+		if node.Issue != nil {
+			n.IssueID = string(node.Issue.ID)
+			n.IssueIdentifier = string(node.Issue.Identifier)
+			n.IssueTitle = string(node.Issue.Title)
+			n.IssueState = string(node.Issue.State.Name)
+		}
+		if node.Comment != nil {
+			n.CommentBody = string(node.Comment.Body)
+		}
+		if node.Actor != nil {
+			n.ActorName = string(node.Actor.Name)
+		}
+		notifications = append(notifications, n)
+	}
+
+	return notifications, nil
+}
+
+// MarkNotificationRead marks a notification as read.
+func (c *Client) MarkNotificationRead(ctx context.Context, notificationID string) error {
+	var mutation struct {
+		NotificationUpdate struct {
+			Success graphql.Boolean
+		} `graphql:"notificationUpdate(id: $id, input: $input)"`
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	input := NotificationUpdateInput{
+		"readAt": graphql.String(now),
+	}
+
+	variables := map[string]interface{}{
+		"id":    graphql.String(notificationID),
+		"input": input,
+	}
+
+	if err := c.client.Mutate(ctx, &mutation, variables); err != nil {
+		logger.ErrorWithErr(err, "linearapi.client: MarkNotificationRead failed notification_id=%s", notificationID)
+		return fmt.Errorf("mark notification read %s: %w", notificationID, err)
+	}
+
+	if !bool(mutation.NotificationUpdate.Success) {
+		logger.Error("linearapi.client: MarkNotificationRead operation failed success=false notification_id=%s", notificationID)
+		return fmt.Errorf("mark notification read %s: operation failed", notificationID)
+	}
+
+	return nil
 }
