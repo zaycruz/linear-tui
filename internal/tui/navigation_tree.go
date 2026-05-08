@@ -15,6 +15,8 @@ type NavigationNode struct {
 	IsStatus        bool
 	IsCycle         bool
 	IsNotifications bool
+	IsSavedView     bool
+	SavedView       *SavedView
 	StateID         string
 	StateName       string
 	CycleID         string

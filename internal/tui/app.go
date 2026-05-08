@@ -67,6 +67,18 @@ type App struct {
 	agentPromptTemplates   []config.AgentPromptTemplate
 	dueDateModal           *DueDateModal
 	relationModal          *RelationModal
+	fuzzyFinder            *FuzzyFinder
+	velocityModal          *VelocityModal
+	statsModal             *StatsModal
+	triageModal            *TriageModal
+
+	// Filter state for assignee / label
+	filterAssigneeMe bool   // when true, filter to current user's issues
+	filterLabelID    string // when set, filter to this label ID
+	filterLabelName  string // display name for status bar
+
+	// Saved views
+	savedViews []SavedView
 
 	// App state (protected by issuesMu)
 	issuesMu            sync.RWMutex
@@ -173,6 +185,11 @@ func NewApp(api *linearapi.Client, cfg config.Config, templates []config.AgentPr
 	app.fetchIssueByID = api.FetchIssueByID
 	app.queueUpdateDraw = func(f func()) {
 		app.app.QueueUpdateDraw(f)
+	}
+
+	// Load saved views from disk (best-effort)
+	if views, err := loadSavedViews(); err == nil {
+		app.savedViews = views
 	}
 
 	app.applyThemeStyles()
@@ -343,6 +360,10 @@ func (a *App) rebuildModals() {
 	a.agentPromptModal = NewAgentPromptModal(a)
 	a.dueDateModal = NewDueDateModal(a)
 	a.relationModal = NewRelationModal(a)
+	a.fuzzyFinder = NewFuzzyFinder(a)
+	a.velocityModal = NewVelocityModal(a)
+	a.statsModal = NewStatsModal(a)
+	a.triageModal = NewTriageModal(a)
 	if a.pages == nil || !a.pages.HasPage("agent_output") {
 		a.agentOutputModal = NewAgentOutputModal(a)
 	} else {
@@ -493,6 +514,28 @@ func (a *App) rebuildNavigationTree(teams []linearapi.Team) {
 		SetReference(&NavigationNode{ID: "all", Text: "All Issues"}).
 		SetExpanded(true)
 	root.AddChild(allIssues)
+
+	// Add "Saved Views" section if any exist
+	if len(a.savedViews) > 0 {
+		svGroup := tview.NewTreeNode("Saved Views").
+			SetColor(a.theme.Accent).
+			SetSelectable(false).
+			SetExpanded(true)
+		for i, sv := range a.savedViews {
+			svCopy := sv
+			idx := i
+			svNode := tview.NewTreeNode("  " + svCopy.Name).
+				SetColor(a.theme.SecondaryText).
+				SetReference(&NavigationNode{
+					ID:          fmt.Sprintf("saved_view_%d", idx),
+					Text:        svCopy.Name,
+					IsSavedView: true,
+					SavedView:   &svCopy,
+				})
+			svGroup.AddChild(svNode)
+		}
+		root.AddChild(svGroup)
+	}
 
 	// Add "Notifications" below All Issues
 	notificationsNode := tview.NewTreeNode("Notifications").
@@ -700,6 +743,10 @@ func (a *App) buildLayout() {
 	a.agentRunner = agents.NewRunner()
 	a.dueDateModal = NewDueDateModal(a)
 	a.relationModal = NewRelationModal(a)
+	a.fuzzyFinder = NewFuzzyFinder(a)
+	a.velocityModal = NewVelocityModal(a)
+	a.statsModal = NewStatsModal(a)
+	a.triageModal = NewTriageModal(a)
 
 	// Add main layout to pages
 	a.pages.AddPage("main", a.mainLayout, true, true)
@@ -767,6 +814,26 @@ func (a *App) bindGlobalKeys() {
 			return a.relationModal.HandleKey(event)
 		}
 
+		// Check if fuzzy finder is visible and handle its keys
+		if a.pages.HasPage("fuzzy_finder") && a.fuzzyFinder != nil {
+			return a.fuzzyFinder.HandleKey(event)
+		}
+
+		// Check if velocity modal is visible and handle its keys
+		if a.pages.HasPage("velocity") && a.velocityModal != nil {
+			return a.velocityModal.HandleKey(event)
+		}
+
+		// Check if stats modal is visible and handle its keys
+		if a.pages.HasPage("stats") && a.statsModal != nil {
+			return a.statsModal.HandleKey(event)
+		}
+
+		// Check if triage modal is visible and handle its keys
+		if a.pages.HasPage("triage") && a.triageModal != nil {
+			return a.triageModal.HandleKey(event)
+		}
+
 		// Handle palette first if it's open
 		if a.focusedPane == FocusPalette {
 			return a.handlePaletteKey(event)
@@ -774,6 +841,11 @@ func (a *App) bindGlobalKeys() {
 
 		// Global shortcuts (only when not in palette)
 		switch event.Key() {
+		case tcell.KeyCtrlP:
+			if a.fuzzyFinder != nil {
+				a.fuzzyFinder.Show()
+			}
+			return nil
 		case tcell.KeyEscape:
 			// Clear bulk selection first if any
 			if len(a.selectedIssueIDs) > 0 {
@@ -907,6 +979,32 @@ func (a *App) handleIssuesKey(event *tcell.EventKey) *tcell.EventKey {
 			a.updateFocus()
 			return nil
 		}
+		// Handle Shift+A: toggle "filter to my issues"
+		if r == 'A' {
+			a.toggleFilterAssigneeMe()
+			return nil
+		}
+		// Handle Shift+Y: copy git branch name
+		if r == 'Y' {
+			issue := a.GetSelectedIssue()
+			if issue != nil {
+				branchName := issue.GitBranchName
+				if branchName == "" {
+					branchName = slugifyBranchName(issue.Identifier, issue.Title)
+				}
+				if err := copyToClipboard(branchName); err != nil {
+					a.updateStatusBarWithError(err)
+				} else {
+					a.statusBar.SetText(fmt.Sprintf("%sCopied: %s[-]", a.themeTags.Accent, branchName))
+				}
+			}
+			return nil
+		}
+		// Handle Shift+L: label filter
+		if r == 'L' {
+			a.showLabelFilterPicker()
+			return nil
+		}
 		// Handle command shortcuts (plain letters) - skip navigation keys
 		if r != 'j' && r != 'k' { // j/k are handled by table for up/down
 			for _, cmd := range a.paletteCtrl.commands {
@@ -918,6 +1016,52 @@ func (a *App) handleIssuesKey(event *tcell.EventKey) *tcell.EventKey {
 		}
 	}
 	return event
+}
+
+// toggleFilterAssigneeMe toggles the "my issues only" filter and refreshes.
+func (a *App) toggleFilterAssigneeMe() {
+	a.filterAssigneeMe = !a.filterAssigneeMe
+	a.updateStatusBar()
+	go a.refreshIssues()
+}
+
+// showLabelFilterPicker opens a label picker to set a label filter.
+func (a *App) showLabelFilterPicker() {
+	teamID := a.GetSelectedTeamID()
+	if teamID == "" {
+		a.updateStatusBarWithError(fmt.Errorf("no team selected"))
+		return
+	}
+	go func() {
+		ctx := context.Background()
+		labels, err := a.cache.GetIssueLabels(ctx, teamID)
+		if err != nil {
+			a.QueueUpdateDraw(func() {
+				a.updateStatusBarWithError(err)
+			})
+			return
+		}
+		a.QueueUpdateDraw(func() {
+			items := make([]PickerItem, 0, len(labels)+1)
+			items = append(items, PickerItem{ID: "", Label: "Clear label filter"})
+			for _, lbl := range labels {
+				items = append(items, PickerItem{ID: lbl.ID, Label: lbl.Name})
+			}
+			a.pickerActive = true
+			a.pickerModal.Show("Filter by Label", items, func(item PickerItem) {
+				a.pickerActive = false
+				if item.ID == "" {
+					a.filterLabelID = ""
+					a.filterLabelName = ""
+				} else {
+					a.filterLabelID = item.ID
+					a.filterLabelName = item.Label
+				}
+				a.updateStatusBar()
+				go a.refreshIssues()
+			})
+		})
+	}()
 }
 
 // handleDetailsKey handles keyboard input when details pane is focused.
@@ -1314,6 +1458,12 @@ func (a *App) refreshIssuesWithFocusChange(allowFocusChange bool, issueID ...str
 			First:   a.config.PageSize,
 			Search:  a.searchQuery,
 			OrderBy: string(a.sortField),
+			LabelID: a.filterLabelID,
+		}
+
+		// Apply assignee-me filter
+		if a.filterAssigneeMe && a.currentUser != nil {
+			params.AssigneeID = a.currentUser.ID
 		}
 
 		// Apply team/project/state/cycle filter based on navigation selection
@@ -1449,6 +1599,16 @@ func (a *App) updateBurndownPanel() {
 	}
 	if a.selectedCycle != nil {
 		text := buildCycleBurndownText(a.selectedCycle, 20)
+		// Append per-assignee breakdown if issues are loaded
+		a.issuesMu.RLock()
+		issues := a.issues
+		a.issuesMu.RUnlock()
+		if len(issues) > 0 {
+			breakdown := buildAssigneeBreakdown(issues)
+			if breakdown != "" {
+				text = text + "\n" + breakdown
+			}
+		}
 		a.burndownPanel.SetText(text)
 		a.burndownPanel.SetTitle(" Cycle Burndown ")
 	} else {
@@ -1748,6 +1908,12 @@ func (a *App) onNavigationSelected(node *NavigationNode) {
 		return
 	}
 
+	// Handle saved view selection
+	if node.IsSavedView && node.SavedView != nil {
+		a.applySavedView(*node.SavedView)
+		return
+	}
+
 	// Reset notifications view when navigating away
 	a.inNotificationsView = false
 
@@ -1870,6 +2036,16 @@ func (a *App) updateStatusBar() {
 		bulkText = fmt.Sprintf("%s%d selected[-]", a.themeTags.Warning, len(a.selectedIssueIDs))
 	}
 
+	filterMeText := ""
+	if a.filterAssigneeMe {
+		filterMeText = fmt.Sprintf("%s[me][-]", a.themeTags.Warning)
+	}
+
+	filterLabelText := ""
+	if a.filterLabelID != "" && a.filterLabelName != "" {
+		filterLabelText = fmt.Sprintf("%s[label: %s][-]", a.themeTags.Warning, a.filterLabelName)
+	}
+
 	sep := fmt.Sprintf("%s | [-]", a.themeTags.Border)
 
 	parts := []string{helpText}
@@ -1878,6 +2054,12 @@ func (a *App) updateStatusBar() {
 	}
 	if searchText != "" {
 		parts = append(parts, searchText)
+	}
+	if filterMeText != "" {
+		parts = append(parts, filterMeText)
+	}
+	if filterLabelText != "" {
+		parts = append(parts, filterLabelText)
 	}
 	parts = append(parts, statusText)
 	if bulkText != "" {

@@ -290,8 +290,10 @@ type FetchIssuesParams struct {
 	Search    string
 	// OrderBy specifies the sort order. Valid API values are "updatedAt" and "createdAt".
 	// "priority" is also supported and will be sorted client-side after fetching.
-	OrderBy string
-	First   int
+	OrderBy    string
+	First      int
+	AssigneeID string // When set, filter to issues assigned to this user
+	LabelID    string // When set, filter to issues with this label
 	// OnProgress is an optional callback invoked after each page is fetched.
 	OnProgress func(IssueFetchProgress)
 }
@@ -581,6 +583,12 @@ func buildBaseIssueFilter(params FetchIssuesParams) IssueFilter {
 	}
 	if params.CycleID != "" {
 		filter["cycle"] = map[string]interface{}{"id": map[string]interface{}{"eq": params.CycleID}}
+	}
+	if params.AssigneeID != "" {
+		filter["assignee"] = map[string]interface{}{"id": map[string]interface{}{"eq": params.AssigneeID}}
+	}
+	if params.LabelID != "" {
+		filter["labels"] = map[string]interface{}{"id": map[string]interface{}{"eq": params.LabelID}}
 	}
 	return filter
 }

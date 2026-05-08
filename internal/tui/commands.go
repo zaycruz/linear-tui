@@ -220,33 +220,45 @@ func DefaultCommands(app *App) []Command {
 				if issue == nil || issue.URL == "" {
 					return
 				}
-				_ = openURL(issue.URL)
-			},
-		},
-		{
-			ID:           "copy_id",
-			Title:        "Copy issue ID",
-			Keywords:     []string{"copy", "id", "c", "identifier"},
-			ShortcutRune: 'y',
-			Run: func(a *App) {
-				issue := a.GetSelectedIssue()
-				if issue == nil {
-					return
+				if err := openURL(issue.URL); err != nil {
+					a.updateStatusBarWithError(err)
+				} else {
+					a.statusBar.SetText(fmt.Sprintf("%sOpened in browser[-]", a.themeTags.Accent))
 				}
-				_ = copyToClipboard(issue.Identifier)
 			},
 		},
 		{
 			ID:           "copy_url",
 			Title:        "Copy issue URL",
-			Keywords:     []string{"copy", "url", "link"},
-			ShortcutRune: 'w', // 'w' for web URL
+			Keywords:     []string{"copy", "url", "link", "y"},
+			ShortcutRune: 'y',
 			Run: func(a *App) {
 				issue := a.GetSelectedIssue()
 				if issue == nil || issue.URL == "" {
 					return
 				}
-				_ = copyToClipboard(issue.URL)
+				if err := copyToClipboard(issue.URL); err != nil {
+					a.updateStatusBarWithError(err)
+				} else {
+					a.statusBar.SetText(fmt.Sprintf("%sCopied: %s[-]", a.themeTags.Accent, issue.URL))
+				}
+			},
+		},
+		{
+			ID:           "copy_id",
+			Title:        "Copy issue identifier",
+			Keywords:     []string{"copy", "id", "c", "identifier"},
+			ShortcutRune: 'c',
+			Run: func(a *App) {
+				issue := a.GetSelectedIssue()
+				if issue == nil {
+					return
+				}
+				if err := copyToClipboard(issue.Identifier); err != nil {
+					a.updateStatusBarWithError(err)
+				} else {
+					a.statusBar.SetText(fmt.Sprintf("%sCopied: %s[-]", a.themeTags.Accent, issue.Identifier))
+				}
 			},
 		},
 		{
@@ -1040,6 +1052,106 @@ func DefaultCommands(app *App) []Command {
 						a.LoadAndShowNotifications()
 					})
 				}()
+			},
+		},
+		// velocity: show velocity chart overlay
+		{
+			ID:       "velocity",
+			Title:    "Velocity chart (last 6 cycles)",
+			Keywords: []string{"velocity", "chart", "cycles", "sprint"},
+			Run: func(a *App) {
+				if len(a.cycles) == 0 {
+					a.updateStatusBarWithError(fmt.Errorf("no cycles available — select a team first"))
+					return
+				}
+				teamName := ""
+				if a.selectedNavigation != nil {
+					teamName = a.selectedNavigation.Text
+					if a.selectedNavigation.TeamID != "" {
+						// Use team name from navigation
+						teamName = a.selectedNavigation.Text
+					}
+				}
+				if a.velocityModal == nil {
+					a.velocityModal = NewVelocityModal(a)
+				}
+				a.velocityModal.Show(a.cycles, teamName)
+			},
+		},
+		// stats: show team throughput stats overlay
+		{
+			ID:       "stats",
+			Title:    "Team throughput stats",
+			Keywords: []string{"stats", "throughput", "opened", "closed"},
+			Run: func(a *App) {
+				a.issuesMu.RLock()
+				issues := a.issues
+				a.issuesMu.RUnlock()
+				teamName := ""
+				if a.selectedNavigation != nil {
+					teamName = a.selectedNavigation.Text
+				}
+				if a.statsModal == nil {
+					a.statsModal = NewStatsModal(a)
+				}
+				a.statsModal.Show(issues, teamName)
+			},
+		},
+		// export_cycle: generate markdown cycle report and copy to clipboard
+		{
+			ID:       "export_cycle",
+			Title:    "Export cycle report to clipboard",
+			Keywords: []string{"export", "cycle", "report", "markdown"},
+			Run: func(a *App) {
+				cyc := a.selectedCycle
+				if cyc == nil {
+					a.updateStatusBarWithError(fmt.Errorf("no cycle selected — navigate to a cycle first"))
+					return
+				}
+				a.issuesMu.RLock()
+				issues := a.issues
+				a.issuesMu.RUnlock()
+				report := buildCycleReport(cyc, issues, a.teamProjects)
+				if err := copyToClipboard(report); err != nil {
+					logger.ErrorWithErr(err, "tui.commands: export_cycle clipboard failed")
+					a.updateStatusBarWithError(err)
+					return
+				}
+				logger.Info("tui.commands: cycle report copied to clipboard cycle=%s", cyc.DisplayName())
+				a.statusBar.SetText(fmt.Sprintf("%sCycle report copied to clipboard[-]", a.themeTags.Accent))
+			},
+		},
+		// triage: rapid-fire backlog grooming
+		{
+			ID:       "triage",
+			Title:    "Triage mode (rapid backlog grooming)",
+			Keywords: []string{"triage", "groom", "backlog"},
+			Run: func(a *App) {
+				a.issuesMu.RLock()
+				issues := a.issues
+				a.issuesMu.RUnlock()
+				if a.triageModal == nil {
+					a.triageModal = NewTriageModal(a)
+				}
+				a.triageModal.Start(issues)
+			},
+		},
+		// save_view: save current filters as a named view
+		{
+			ID:       "save_view",
+			Title:    "Save current view as named filter",
+			Keywords: []string{"save", "view", "filter", "named"},
+			Run: func(a *App) {
+				a.promptSaveView()
+			},
+		},
+		// delete_view: delete a saved view
+		{
+			ID:       "delete_view",
+			Title:    "Delete a saved view",
+			Keywords: []string{"delete", "view", "remove"},
+			Run: func(a *App) {
+				a.promptDeleteView()
 			},
 		},
 	}

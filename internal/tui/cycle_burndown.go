@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/rivo/tview"
@@ -94,7 +95,7 @@ func buildCycleBurndownText(cycle *linearapi.Cycle, barWidth int) string {
 	return fmt.Sprintf("%s%s  %s  %d/%d done  %d%%", name, dateRange, bar, done, tot, pct)
 }
 
-// buildBurndownPanel creates a 3-line tview.TextView showing the cycle burndown bar.
+// buildBurndownPanel creates a tview.TextView showing the cycle burndown bar.
 func buildBurndownPanel(app *App, cycle *linearapi.Cycle) *tview.TextView {
 	tv := tview.NewTextView()
 	tv.SetBorder(true).
@@ -111,4 +112,55 @@ func buildBurndownPanel(app *App, cycle *linearapi.Cycle) *tview.TextView {
 	}
 
 	return tv
+}
+
+// buildAssigneeBreakdown builds a one-line summary of issues per assignee for the cycle.
+// Format: Alex: 3 done  2 in-progress  |  Jordan: 1 done  4 in-progress  |  Unassigned: 2
+func buildAssigneeBreakdown(issues []linearapi.Issue) string {
+	type assigneeStats struct {
+		done       int
+		inProgress int
+		other      int
+	}
+	stats := make(map[string]*assigneeStats)
+
+	for _, issue := range issues {
+		name := issue.Assignee
+		if name == "" {
+			name = "Unassigned"
+		}
+		if _, ok := stats[name]; !ok {
+			stats[name] = &assigneeStats{}
+		}
+		stateLower := strings.ToLower(issue.State)
+		if strings.Contains(stateLower, "done") || strings.Contains(stateLower, "complet") || strings.Contains(stateLower, "cancel") {
+			stats[name].done++
+		} else if strings.Contains(stateLower, "progress") || strings.Contains(stateLower, "review") {
+			stats[name].inProgress++
+		} else {
+			stats[name].other++
+		}
+	}
+
+	if len(stats) == 0 {
+		return ""
+	}
+
+	// Sort names for stable output
+	names := make([]string, 0, len(stats))
+	for n := range stats {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	var parts []string
+	for _, name := range names {
+		s := stats[name]
+		part := fmt.Sprintf("%s: %d done  %d in-progress", name, s.done, s.inProgress)
+		if s.other > 0 {
+			part += fmt.Sprintf("  %d other", s.other)
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, "  |  ")
 }
