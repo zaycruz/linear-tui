@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
@@ -47,13 +48,17 @@ func (a *App) getRowForIssue(issueID string) int {
 }
 
 // getIssueFromRowModel returns the issue for a given table row using the provided model.
-// Returns nil if the row is invalid.
+// Returns nil if the row is invalid or is a project group header row.
 func getIssueFromRowModel(row int, rows []IssueRow, idToIssue map[string]*linearapi.Issue) *linearapi.Issue {
 	rowIndex := row - 1 // Account for header row
 	if rowIndex < 0 || rowIndex >= len(rows) {
 		return nil
 	}
-	issueID := rows[rowIndex].IssueID
+	issueRow := rows[rowIndex]
+	if issueRow.IsProjectHeader {
+		return nil
+	}
+	issueID := issueRow.IssueID
 	if issue, ok := idToIssue[issueID]; ok {
 		return issue
 	}
@@ -407,6 +412,20 @@ func renderIssuesTableModel(table *tview.Table, rows []IssueRow, idToIssue map[s
 	// Add issue rows using the hierarchical structure
 	for i, issueRow := range rows {
 		row := i + 1
+
+		// Render project group header rows (cycle view)
+		if issueRow.IsProjectHeader {
+			headerText := fmt.Sprintf(" ── %s ──────────────────────────────────────────", issueRow.ProjectName)
+			headerStyle := tcell.StyleDefault.
+				Foreground(theme.SecondaryText).
+				Dim(true)
+			table.SetCell(row, 0, tview.NewTableCell("").SetSelectable(false).SetStyle(headerStyle))
+			table.SetCell(row, 1, tview.NewTableCell("").SetSelectable(false).SetStyle(headerStyle))
+			table.SetCell(row, 2, tview.NewTableCell("").SetSelectable(false).SetStyle(headerStyle))
+			table.SetCell(row, 3, tview.NewTableCell("").SetSelectable(false).SetStyle(headerStyle))
+			table.SetCell(row, 4, tview.NewTableCell(headerText).SetSelectable(false).SetStyle(headerStyle))
+			continue
+		}
 
 		issue, ok := idToIssue[issueRow.IssueID]
 		if !ok || issue == nil {

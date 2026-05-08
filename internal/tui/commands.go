@@ -669,6 +669,69 @@ func DefaultCommands(app *App) []Command {
 				a.createCommentModal.Show(issue.ID, a.handleCreateComment)
 			},
 		},
+		{
+			ID:       "start_cycle",
+			Title:    "Start Cycle",
+			Keywords: []string{"cycle", "start", "sprint"},
+			Run: func(a *App) {
+				cyc := a.selectedCycle
+				if cyc == nil {
+					a.updateStatusBarWithError(fmt.Errorf("no cycle selected"))
+					return
+				}
+				cycleID := cyc.ID
+				teamID := ""
+				if a.selectedNavigation != nil {
+					teamID = a.selectedNavigation.TeamID
+				}
+				go func() {
+					ctx := context.Background()
+					err := a.GetAPI().StartCycle(ctx, cycleID)
+					a.QueueUpdateDraw(func() {
+						if err != nil {
+							logger.ErrorWithErr(err, "tui.commands: failed to start cycle cycle_id=%s", cycleID)
+							a.updateStatusBarWithError(err)
+							return
+						}
+						logger.Info("tui.commands: started cycle cycle_id=%s", cycleID)
+						// Invalidate cycles cache so the sidebar refreshes on next expand
+						if teamID != "" {
+							a.cache.InvalidateCycles(teamID)
+						}
+						a.updateStatusBar()
+					})
+				}()
+			},
+		},
+		{
+			ID:       "add_to_cycle",
+			Title:    "Add Issue to Cycle",
+			Keywords: []string{"cycle", "add", "sprint", "assign cycle"},
+			Run: func(a *App) {
+				issue := a.GetSelectedIssue()
+				if issue == nil {
+					a.updateStatusBarWithError(fmt.Errorf("no issue selected"))
+					return
+				}
+				issueID := issue.ID
+				issueIdentifier := issue.Identifier
+				a.ShowCyclePicker(func(cycleID string) {
+					go func() {
+						ctx := context.Background()
+						err := a.GetAPI().AddIssueToCycle(ctx, issueID, cycleID)
+						a.QueueUpdateDraw(func() {
+							if err != nil {
+								logger.ErrorWithErr(err, "tui.commands: failed to add issue to cycle issue=%s cycle_id=%s", issueIdentifier, cycleID)
+								a.updateStatusBarWithError(err)
+								return
+							}
+							logger.Info("tui.commands: added issue to cycle issue=%s cycle_id=%s", issueIdentifier, cycleID)
+							go a.refreshIssues(issueID)
+						})
+					}()
+				})
+			},
+		},
 	}
 	if len(availableProviders) == 0 {
 		filtered := make([]Command, 0, len(commands))

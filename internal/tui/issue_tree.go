@@ -6,6 +6,90 @@ import (
 	"github.com/roeyazroel/linear-tui/internal/linearapi"
 )
 
+// BuildIssueRowsGroupedByProject builds rows like BuildIssueRows but groups them by
+// project, inserting a non-selectable header row at the start of each group.
+// projectNames maps projectID → display name; empty string projectID → "No Project".
+func BuildIssueRowsGroupedByProject(issues []linearapi.Issue, expanded map[string]bool, projectNames map[string]string) ([]IssueRow, map[string]*linearapi.Issue) {
+	idToIssue := make(map[string]*linearapi.Issue, len(issues))
+	for i := range issues {
+		idToIssue[issues[i].ID] = &issues[i]
+	}
+
+	// Group issues by ProjectID
+	type projectGroup struct {
+		projectID string
+		issues    []*linearapi.Issue
+	}
+	groupMap := make(map[string]*projectGroup)
+	groupOrder := make([]string, 0)
+
+	for i := range issues {
+		issue := &issues[i]
+		pid := issue.ProjectID
+		if _, exists := groupMap[pid]; !exists {
+			groupMap[pid] = &projectGroup{projectID: pid}
+			groupOrder = append(groupOrder, pid)
+		}
+		groupMap[pid].issues = append(groupMap[pid].issues, issue)
+	}
+
+	// Sort groups: non-empty project names first (alphabetical), then "No Project"
+	sort.Slice(groupOrder, func(i, j int) bool {
+		a, b := groupOrder[i], groupOrder[j]
+		nameA := projectNameFor(a, projectNames)
+		nameB := projectNameFor(b, projectNames)
+		if nameA == "" && nameB != "" {
+			return false
+		}
+		if nameA != "" && nameB == "" {
+			return true
+		}
+		return nameA < nameB
+	})
+
+	var rows []IssueRow
+
+	for _, pid := range groupOrder {
+		grp := groupMap[pid]
+		if len(grp.issues) == 0 {
+			continue
+		}
+
+		// Insert project header row
+		pName := projectNameFor(pid, projectNames)
+		rows = append(rows, IssueRow{
+			IsProjectHeader: true,
+			ProjectName:     pName,
+		})
+
+		// Build per-group rows (no hierarchy within groups for simplicity)
+		for _, issue := range grp.issues {
+			hasChildren := len(issue.Children) > 0
+			isExpanded := expanded[issue.ID]
+			rows = append(rows, IssueRow{
+				IssueID:     issue.ID,
+				Level:       0,
+				IsParent:    hasChildren,
+				HasChildren: hasChildren,
+				IsExpanded:  isExpanded,
+			})
+		}
+	}
+
+	return rows, idToIssue
+}
+
+// projectNameFor returns a display name for a project ID using the provided name map.
+func projectNameFor(projectID string, names map[string]string) string {
+	if projectID == "" {
+		return "No Project"
+	}
+	if name, ok := names[projectID]; ok && name != "" {
+		return name
+	}
+	return "No Project"
+}
+
 // IssueRow represents a single row in the issues table with hierarchy info.
 type IssueRow struct {
 	IssueID     string // Reference to the issue
@@ -13,6 +97,10 @@ type IssueRow struct {
 	IsParent    bool   // True if this issue has children
 	HasChildren bool   // True if this issue has children (same as IsParent for now)
 	IsExpanded  bool   // True if children are shown (only meaningful when HasChildren is true)
+
+	// Project group header support (cycle view)
+	IsProjectHeader bool   // True if this is a non-selectable project header row
+	ProjectName     string // Project name for header rows
 }
 
 // BuildIssueRows constructs a flattened list of rows for table rendering.

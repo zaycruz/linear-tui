@@ -8,13 +8,15 @@ import (
 type NavigationNode struct {
 	ID        string
 	Text      string
-	TeamID    string // For team, project, and status nodes
+	TeamID    string // For team, project, status, and cycle nodes
 	Children  []*NavigationNode
 	IsTeam    bool
 	IsProject bool
 	IsStatus  bool
+	IsCycle   bool
 	StateID   string
 	StateName string
+	CycleID   string
 }
 
 // buildNavigationTree creates and configures the navigation tree widget.

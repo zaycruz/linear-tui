@@ -36,6 +36,10 @@ type TeamCache struct {
 	// Label caches (merged team + workspace labels per team)
 	labels       map[string][]linearapi.IssueLabel
 	labelsExpiry map[string]time.Time
+
+	// Cycle caches per team
+	cycles       map[string][]linearapi.Cycle
+	cyclesExpiry map[string]time.Time
 }
 
 // NewTeamCache creates a new team cache with the given client and TTL.
@@ -51,6 +55,8 @@ func NewTeamCache(client *linearapi.Client, ttl time.Duration) *TeamCache {
 		statesExpiry:   make(map[string]time.Time),
 		labels:         make(map[string][]linearapi.IssueLabel),
 		labelsExpiry:   make(map[string]time.Time),
+		cycles:         make(map[string][]linearapi.Cycle),
+		cyclesExpiry:   make(map[string]time.Time),
 	}
 }
 
@@ -159,6 +165,19 @@ func (c *TeamCache) GetIssueLabels(ctx context.Context, teamID string) ([]linear
 	return getCachedOrFetch(ctx, c, teamID, c.labels, c.labelsExpiry, c.client.ListIssueLabels)
 }
 
+// GetCycles returns cached cycles for a team or fetches them from the API.
+func (c *TeamCache) GetCycles(ctx context.Context, teamID string) ([]linearapi.Cycle, error) {
+	return getCachedOrFetch(ctx, c, teamID, c.cycles, c.cyclesExpiry, c.client.ListCycles)
+}
+
+// InvalidateCycles clears the cycles cache for a specific team.
+func (c *TeamCache) InvalidateCycles(teamID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.cycles, teamID)
+	delete(c.cyclesExpiry, teamID)
+}
+
 // InvalidateTeams clears the teams cache.
 func (c *TeamCache) InvalidateTeams() {
 	c.mu.Lock()
@@ -217,6 +236,8 @@ func (c *TeamCache) InvalidateAll() {
 	c.statesExpiry = make(map[string]time.Time)
 	c.labels = make(map[string][]linearapi.IssueLabel)
 	c.labelsExpiry = make(map[string]time.Time)
+	c.cycles = make(map[string][]linearapi.Cycle)
+	c.cyclesExpiry = make(map[string]time.Time)
 }
 
 // PreloadTeamMetadata preloads all metadata for a team (users, projects, states, labels).
@@ -224,9 +245,9 @@ func (c *TeamCache) InvalidateAll() {
 func (c *TeamCache) PreloadTeamMetadata(ctx context.Context, teamID string) error {
 	// Load in parallel
 	var wg sync.WaitGroup
-	var usersErr, projectsErr, statesErr, labelsErr error
+	var usersErr, projectsErr, statesErr, labelsErr, cyclesErr error
 
-	wg.Add(4)
+	wg.Add(5)
 
 	go func() {
 		defer wg.Done()
@@ -248,6 +269,11 @@ func (c *TeamCache) PreloadTeamMetadata(ctx context.Context, teamID string) erro
 		_, labelsErr = c.GetIssueLabels(ctx, teamID)
 	}()
 
+	go func() {
+		defer wg.Done()
+		_, cyclesErr = c.GetCycles(ctx, teamID)
+	}()
+
 	wg.Wait()
 
 	// Return first error encountered
@@ -262,6 +288,9 @@ func (c *TeamCache) PreloadTeamMetadata(ctx context.Context, teamID string) erro
 	}
 	if labelsErr != nil {
 		return labelsErr
+	}
+	if cyclesErr != nil {
+		return cyclesErr
 	}
 
 	return nil

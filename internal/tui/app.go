@@ -92,6 +92,9 @@ type App struct {
 	currentUser    *linearapi.User
 	teamUsers      []linearapi.User
 	workflowStates []linearapi.WorkflowState
+	teamProjects   []linearapi.Project
+	cycles         []linearapi.Cycle
+	selectedCycle  *linearapi.Cycle
 
 	// Loading state
 	isLoading                      bool
@@ -367,7 +370,7 @@ func (a *App) applyNavigationNodeColors(node *tview.TreeNode) {
 	if ref == nil {
 		node.SetColor(a.theme.Accent)
 	} else if navNode, ok := ref.(*NavigationNode); ok {
-		if navNode.IsProject || navNode.IsStatus {
+		if navNode.IsProject || navNode.IsStatus || navNode.IsCycle {
 			node.SetColor(a.theme.SecondaryText)
 		} else {
 			node.SetColor(a.theme.Foreground)
@@ -417,6 +420,9 @@ func (a *App) resetCachedState() {
 	a.currentUser = nil
 	a.teamUsers = nil
 	a.workflowStates = nil
+	a.teamProjects = nil
+	a.cycles = nil
+	a.selectedCycle = nil
 	a.activeIssuesSection = IssuesSectionOther
 	a.expandedState = make(map[string]bool)
 
@@ -506,15 +512,16 @@ func (a *App) onTeamExpanded(teamID string, teamNode *tview.TreeNode) {
 		return
 	}
 
-	// Load projects and workflow states asynchronously
+	// Load projects, workflow states, and cycles asynchronously
 	go func() {
 		logger.Debug("tui.app: loading navigation children team_id=%s", teamID)
 		ctx := context.Background()
 		var projects []linearapi.Project
 		var states []linearapi.WorkflowState
-		var projectsErr, statesErr error
+		var cycles []linearapi.Cycle
+		var projectsErr, statesErr, cyclesErr error
 		var wg sync.WaitGroup
-		wg.Add(2)
+		wg.Add(3)
 		go func() {
 			defer wg.Done()
 			projects, projectsErr = a.cache.GetProjects(ctx, teamID)
@@ -522,6 +529,10 @@ func (a *App) onTeamExpanded(teamID string, teamNode *tview.TreeNode) {
 		go func() {
 			defer wg.Done()
 			states, statesErr = a.cache.GetWorkflowStates(ctx, teamID)
+		}()
+		go func() {
+			defer wg.Done()
+			cycles, cyclesErr = a.cache.GetCycles(ctx, teamID)
 		}()
 		wg.Wait()
 		if projectsErr != nil {
@@ -538,7 +549,11 @@ func (a *App) onTeamExpanded(teamID string, teamNode *tview.TreeNode) {
 			})
 			return
 		}
-		logger.Debug("tui.app: loaded navigation children team_id=%s projects=%d states=%d", teamID, len(projects), len(states))
+		if cyclesErr != nil {
+			logger.ErrorWithErr(cyclesErr, "tui.app: failed to load cycles team_id=%s", teamID)
+			// Non-fatal: log but don't bail out
+		}
+		logger.Debug("tui.app: loaded navigation children team_id=%s projects=%d states=%d cycles=%d", teamID, len(projects), len(states), len(cycles))
 
 		a.app.QueueUpdateDraw(func() {
 			// Double-check children haven't been added by another goroutine
@@ -584,6 +599,35 @@ func (a *App) onTeamExpanded(teamID string, teamNode *tview.TreeNode) {
 						TeamID:    teamID,
 					})
 				teamNode.AddChild(projNode)
+			}
+			if len(cycles) > 0 {
+				cyclesGroup := tview.NewTreeNode("  Cycles").
+					SetColor(a.theme.SecondaryText).
+					SetSelectable(false).
+					SetReference(&NavigationNode{
+						ID:     fmt.Sprintf("%s-cycles", teamID),
+						Text:   "Cycles",
+						TeamID: teamID,
+					})
+				for _, cyc := range cycles {
+					label := fmt.Sprintf("    %s  %d%%", cyc.DisplayName(), cyc.ProgressPercent())
+					if !cyc.StartsAt.IsZero() && !cyc.EndsAt.IsZero() {
+						label += fmt.Sprintf("  %s→%s",
+							cyc.StartsAt.Format("Jan2"),
+							cyc.EndsAt.Format("Jan2"))
+					}
+					cycNode := tview.NewTreeNode(label).
+						SetColor(a.theme.SecondaryText).
+						SetReference(&NavigationNode{
+							ID:      cyc.ID,
+							Text:    cyc.DisplayName(),
+							TeamID:  teamID,
+							IsCycle: true,
+							CycleID: cyc.ID,
+						})
+					cyclesGroup.AddChild(cycNode)
+				}
+				teamNode.AddChild(cyclesGroup)
 			}
 			teamNode.SetExpanded(true)
 		})
@@ -1233,7 +1277,7 @@ func (a *App) refreshIssuesWithFocusChange(allowFocusChange bool, issueID ...str
 			OrderBy: string(a.sortField),
 		}
 
-		// Apply team/project/state filter based on navigation selection
+		// Apply team/project/state/cycle filter based on navigation selection
 		if a.selectedNavigation != nil {
 			switch {
 			case a.selectedNavigation.IsStatus:
@@ -1244,8 +1288,11 @@ func (a *App) refreshIssuesWithFocusChange(allowFocusChange bool, issueID ...str
 			case a.selectedNavigation.IsProject:
 				params.TeamID = a.selectedNavigation.TeamID
 				params.ProjectID = a.selectedNavigation.ID
+			case a.selectedNavigation.IsCycle:
+				params.TeamID = a.selectedNavigation.TeamID
+				params.CycleID = a.selectedNavigation.CycleID
 			}
-			// If "All Issues", no team/project filter
+			// If "All Issues", no team/project/cycle filter
 		}
 
 		fetchPage := a.fetchIssuesPage
@@ -1391,9 +1438,20 @@ func (a *App) rebuildIssuesTables(targetIssueID string) *linearapi.Issue {
 	}
 	myIssues, otherIssues := splitIssuesByAssignee(issues, currentUserID)
 
-	// Build hierarchical tree rows for each section.
-	a.myIssueRows, a.myIDToIssue = BuildIssueRows(myIssues, a.expandedState)
-	a.otherIssueRows, a.otherIDToIssue = BuildIssueRows(otherIssues, a.expandedState)
+	// In cycle view, group by project instead of hierarchical tree.
+	inCycleView := a.selectedNavigation != nil && a.selectedNavigation.IsCycle
+	if inCycleView {
+		projectNames := make(map[string]string)
+		for _, p := range a.teamProjects {
+			projectNames[p.ID] = p.Name
+		}
+		a.myIssueRows, a.myIDToIssue = BuildIssueRowsGroupedByProject(myIssues, a.expandedState, projectNames)
+		a.otherIssueRows, a.otherIDToIssue = BuildIssueRowsGroupedByProject(otherIssues, a.expandedState, projectNames)
+	} else {
+		// Build hierarchical tree rows for each section.
+		a.myIssueRows, a.myIDToIssue = BuildIssueRows(myIssues, a.expandedState)
+		a.otherIssueRows, a.otherIDToIssue = BuildIssueRows(otherIssues, a.expandedState)
+	}
 
 	// Legacy: keep old fields for backward compatibility during migration.
 	a.issueRows = make([]IssueRow, 0, len(a.myIssueRows)+len(a.otherIssueRows))
@@ -1618,27 +1676,49 @@ func (a *App) toggleIssueExpanded(issueID string) {
 
 // onNavigationSelected handles when a navigation item is selected.
 func (a *App) onNavigationSelected(node *NavigationNode) {
-	logger.Debug("tui.app: navigation selected node_id=%s node_text=%s is_team=%v is_project=%v", node.ID, node.Text, node.IsTeam, node.IsProject)
+	logger.Debug("tui.app: navigation selected node_id=%s node_text=%s is_team=%v is_project=%v is_cycle=%v", node.ID, node.Text, node.IsTeam, node.IsProject, node.IsCycle)
 	a.selectedNavigation = node
 
-	// Update selected team/project
-	if node.IsTeam {
-		// Load team metadata (users, workflow states) in background
+	// Update selected team metadata
+	if node.IsTeam || node.IsProject || node.IsStatus || node.IsCycle {
+		teamID := node.TeamID
 		go func() {
-			logger.Debug("tui.app: preloading team metadata team_id=%s", node.TeamID)
+			logger.Debug("tui.app: preloading team metadata team_id=%s", teamID)
 			ctx := context.Background()
-			_ = a.cache.PreloadTeamMetadata(ctx, node.TeamID)
+			_ = a.cache.PreloadTeamMetadata(ctx, teamID)
 
-			// Update team users and states for the selected team
-			users, _ := a.cache.GetUsers(ctx, node.TeamID)
-			states, _ := a.cache.GetWorkflowStates(ctx, node.TeamID)
+			// Update team users, states, projects, and cycles for the selected team
+			users, _ := a.cache.GetUsers(ctx, teamID)
+			states, _ := a.cache.GetWorkflowStates(ctx, teamID)
+			projects, _ := a.cache.GetProjects(ctx, teamID)
+			cycles, _ := a.cache.GetCycles(ctx, teamID)
 
-			logger.Debug("tui.app: loaded team metadata team_id=%s users_count=%d states_count=%d", node.TeamID, len(users), len(states))
+			logger.Debug("tui.app: loaded team metadata team_id=%s users_count=%d states_count=%d cycles_count=%d", teamID, len(users), len(states), len(cycles))
 			a.app.QueueUpdateDraw(func() {
 				a.teamUsers = users
 				a.workflowStates = states
+				a.teamProjects = projects
+				a.cycles = cycles
+
+				// If navigating to a cycle node, record the selected cycle
+				if node.IsCycle {
+					a.selectedCycle = nil
+					for i := range a.cycles {
+						if a.cycles[i].ID == node.CycleID {
+							cyc := a.cycles[i]
+							a.selectedCycle = &cyc
+							break
+						}
+					}
+				} else {
+					a.selectedCycle = nil
+				}
+				a.updateStatusBar()
 			})
 		}()
+	} else {
+		// "All Issues" or team-level: clear selectedCycle
+		a.selectedCycle = nil
 	}
 
 	// Refresh issues for the new selection - run in goroutine to avoid blocking
@@ -1693,6 +1773,8 @@ func (a *App) updateStatusBar() {
 			} else {
 				label = "Status"
 			}
+		} else if a.selectedNavigation.IsCycle && a.selectedCycle != nil {
+			label = fmt.Sprintf("Cycle: %s (%d%%)", a.selectedCycle.DisplayName(), a.selectedCycle.ProgressPercent())
 		}
 		navText = fmt.Sprintf("%s%s[-]", a.themeTags.Accent, label)
 	}
@@ -1912,6 +1994,34 @@ func (a *App) showUserPickerWithUsers(users []linearapi.User, onSelect func(user
 
 	a.pickerActive = true
 	a.pickerModal.Show("Select Assignee", items, func(item PickerItem) {
+		a.pickerActive = false
+		onSelect(item.ID)
+	})
+}
+
+// ShowCyclePicker shows a picker for selecting a cycle from the current team's cycles.
+func (a *App) ShowCyclePicker(onSelect func(cycleID string)) {
+	cycles := a.cycles
+	if len(cycles) == 0 {
+		logger.Warning("tui.app: no cycles available for picker")
+		a.updateStatusBarWithError(fmt.Errorf("no cycles available for the current team"))
+		return
+	}
+
+	items := make([]PickerItem, 0, len(cycles))
+	for _, cyc := range cycles {
+		label := cyc.DisplayName()
+		if cyc.ProgressPercent() > 0 {
+			label += fmt.Sprintf(" (%d%%)", cyc.ProgressPercent())
+		}
+		items = append(items, PickerItem{
+			ID:    cyc.ID,
+			Label: label,
+		})
+	}
+
+	a.pickerActive = true
+	a.pickerModal.Show("Select Cycle", items, func(item PickerItem) {
 		a.pickerActive = false
 		onSelect(item.ID)
 	})

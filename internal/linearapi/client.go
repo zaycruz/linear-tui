@@ -225,6 +225,7 @@ type FetchIssuesParams struct {
 	TeamID    string
 	ProjectID string
 	StateID   string
+	CycleID   string
 	Search    string
 	// OrderBy specifies the sort order. Valid API values are "updatedAt" and "createdAt".
 	// "priority" is also supported and will be sorted client-side after fetching.
@@ -514,6 +515,9 @@ func buildBaseIssueFilter(params FetchIssuesParams) IssueFilter {
 	}
 	if params.StateID != "" {
 		filter["state"] = map[string]interface{}{"id": map[string]interface{}{"eq": params.StateID}}
+	}
+	if params.CycleID != "" {
+		filter["cycle"] = map[string]interface{}{"id": map[string]interface{}{"eq": params.CycleID}}
 	}
 	return filter
 }
