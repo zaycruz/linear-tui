@@ -1326,7 +1326,7 @@ func (a *App) toggleChat() {
 		a.preChatFocus = a.focusedPane
 		a.mainLayout.ResizeItem(a.chatPane.root, 14, 0)
 		if !a.chatClient.Available() {
-			a.chatPane.setStatus("ANTHROPIC_API_KEY not set — chat unavailable")
+			a.chatPane.setStatus("OPENROUTER_API_KEY not set — chat unavailable")
 		}
 		a.focusedPane = FocusChat
 		a.updateFocus()
@@ -1390,7 +1390,7 @@ func (a *App) handleChatSubmit(text string) {
 		return
 	}
 	if !a.chatClient.Available() {
-		a.chatPane.addError("ANTHROPIC_API_KEY not set")
+		a.chatPane.addError("OPENROUTER_API_KEY not set")
 		return
 	}
 

@@ -12,9 +12,8 @@ import (
 )
 
 const (
-	anthropicEndpoint = "https://api.anthropic.com/v1/messages"
-	anthropicVersion  = "2023-06-01"
-	chatModel         = "claude-sonnet-4-6"
+	openRouterEndpoint = "https://openrouter.ai/api/v1/chat/completions"
+	chatModel          = "minimax/minimax-m1-2.7"
 )
 
 // ChatMessage is a single turn in a chat conversation.
@@ -23,16 +22,16 @@ type ChatMessage struct {
 	Content string `json:"content"`
 }
 
-// ChatClient streams completions from the Anthropic API.
+// ChatClient streams completions from OpenRouter.
 type ChatClient struct {
 	apiKey string
 	http   *http.Client
 }
 
-// NewChatClient reads ANTHROPIC_API_KEY from the environment.
+// NewChatClient reads OPENROUTER_API_KEY from the environment.
 func NewChatClient() *ChatClient {
 	return &ChatClient{
-		apiKey: os.Getenv("ANTHROPIC_API_KEY"),
+		apiKey: os.Getenv("OPENROUTER_API_KEY"),
 		http:   &http.Client{},
 	}
 }
@@ -42,27 +41,33 @@ func (c *ChatClient) Available() bool {
 	return c.apiKey != ""
 }
 
-// Stream sends history to the API and calls onToken for each text delta.
+// Stream sends history to OpenRouter and calls onToken for each text delta.
+// System prompt is prepended as the first message with role "system".
 // onDone is called once with the full response text (or an error).
 // The call is non-blocking — execution happens in a goroutine.
 func (c *ChatClient) Stream(ctx context.Context, system string, history []ChatMessage, onToken func(string), onDone func(string, error)) {
 	go func() {
+		msgs := make([]ChatMessage, 0, len(history)+1)
+		if system != "" {
+			msgs = append(msgs, ChatMessage{Role: "system", Content: system})
+		}
+		msgs = append(msgs, history...)
+
 		payload, _ := json.Marshal(map[string]interface{}{
-			"model":      chatModel,
-			"max_tokens": 1024,
-			"system":     system,
-			"messages":   history,
-			"stream":     true,
+			"model":    chatModel,
+			"messages": msgs,
+			"stream":   true,
 		})
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicEndpoint, bytes.NewReader(payload))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, openRouterEndpoint, bytes.NewReader(payload))
 		if err != nil {
 			onDone("", err)
 			return
 		}
-		req.Header.Set("x-api-key", c.apiKey)
-		req.Header.Set("anthropic-version", anthropicVersion)
-		req.Header.Set("content-type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("HTTP-Referer", "https://github.com/zaycruz/linear-tui")
+		req.Header.Set("X-Title", "linear-tui")
 
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -88,18 +93,21 @@ func (c *ChatClient) Stream(ctx context.Context, system string, history []ChatMe
 				break
 			}
 			var ev struct {
-				Type  string `json:"type"`
-				Delta struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"delta"`
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+				} `json:"choices"`
 			}
 			if json.Unmarshal([]byte(data), &ev) != nil {
 				continue
 			}
-			if ev.Type == "content_block_delta" && ev.Delta.Type == "text_delta" {
-				onToken(ev.Delta.Text)
-				full.WriteString(ev.Delta.Text)
+			if len(ev.Choices) > 0 {
+				token := ev.Choices[0].Delta.Content
+				if token != "" {
+					onToken(token)
+					full.WriteString(token)
+				}
 			}
 		}
 		onDone(full.String(), scanner.Err())
