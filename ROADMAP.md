@@ -102,10 +102,30 @@ Avg: 7 / cycle    Best: 8    Trend: ↓
 
 ---
 
+## Phase 5 — Chat Pane Done ✓
+
+> Goal: natural language interface embedded in the TUI. Ask questions, get context, without leaving the terminal.
+
+| # | Feature | Key | Status |
+|---|---------|-----|--------|
+| 5.1 | **Chat pane toggle** | `?` | Done ✓ |
+| 5.2 | **Streaming AI responses** | automatic | Done ✓ |
+| 5.3 | **Workspace context injection** | automatic | Done ✓ |
+
+**How it works:**
+- `?` opens a chat panel at the bottom (14 rows); `?` or `Esc` closes it
+- Powered by Claude (Anthropic API) — set `ANTHROPIC_API_KEY` in env
+- Each message is sent with current workspace context: team, cycle, selected issue, visible issues list
+- Conversation history is maintained for the session
+- Responses stream token-by-token into the panel
+
+---
+
 ## Keybinding Reference
 
 | Key | Action |
 |-----|--------|
+| `?` | Toggle chat pane (natural language) |
 | `o` | Open focused issue in browser |
 | `y` | Copy issue URL to clipboard |
 | `Shift+Y` | Copy git branch name to clipboard |

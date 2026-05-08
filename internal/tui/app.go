@@ -71,6 +71,11 @@ type App struct {
 	velocityModal          *VelocityModal
 	statsModal             *StatsModal
 	triageModal            *TriageModal
+	chatPane               *ChatPane
+	chatClient             *agents.ChatClient
+	chatVisible            bool
+	chatHistory            []agents.ChatMessage
+	preChatFocus           FocusTarget
 
 	// Filter state for assignee / label
 	filterAssigneeMe bool   // when true, filter to current user's issues
@@ -150,6 +155,7 @@ const (
 	FocusIssues
 	FocusDetails
 	FocusPalette
+	FocusChat
 )
 
 // NewApp creates a new application instance.
@@ -721,10 +727,17 @@ func (a *App) buildLayout() {
 		AddItem(a.issuesColumn, 0, 5, false).
 		AddItem(a.detailsView, 0, 3, false)
 
-	// Create vertical layout: content + status bar
+	// Chat pane (hidden until ? is pressed)
+	a.chatClient = agents.NewChatClient()
+	a.chatPane = newChatPane(a.handleChatSubmit, func() {
+		a.toggleChat()
+	})
+
+	// Create vertical layout: content + chat (hidden) + status bar
 	a.mainLayout = tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(contentFlex, 0, 1, true).
+		AddItem(a.chatPane.root, 0, 0, false).
 		AddItem(a.statusBar, 1, 1, false)
 
 	// Build palette modal
@@ -834,6 +847,15 @@ func (a *App) bindGlobalKeys() {
 			return a.triageModal.HandleKey(event)
 		}
 
+		// When chat pane is focused, let the input field handle all keys except ? to close
+		if a.focusedPane == FocusChat {
+			if event.Key() == tcell.KeyRune && event.Rune() == '?' {
+				a.toggleChat()
+				return nil
+			}
+			return event
+		}
+
 		// Handle palette first if it's open
 		if a.focusedPane == FocusPalette {
 			return a.handlePaletteKey(event)
@@ -918,6 +940,9 @@ func (a *App) bindGlobalKeys() {
 				return nil
 			case '/':
 				a.openSearchPalette()
+				return nil
+			case '?':
+				a.toggleChat()
 				return nil
 			}
 		}
@@ -1270,8 +1295,133 @@ func (a *App) updateFocus() {
 		a.detailsCommentsView.SetBorderColor(a.theme.Border)
 		// Update all pane titles
 		a.updateAllPaneTitles()
+	case FocusChat:
+		if a.chatPane != nil {
+			a.app.SetFocus(a.chatPane.input)
+			a.chatPane.root.SetBorderColor(a.theme.BorderFocus)
+		}
+		a.navigationTree.SetBorderColor(a.theme.Border)
+		a.myIssuesTable.SetBorderColor(a.theme.Border)
+		a.otherIssuesTable.SetBorderColor(a.theme.Border)
+		a.detailsDescriptionView.SetBorderColor(a.theme.Border)
+		a.detailsCommentsView.SetBorderColor(a.theme.Border)
+		a.updateAllPaneTitles()
 	}
 	a.updateStatusBar()
+}
+
+// toggleChat opens or closes the chat pane.
+func (a *App) toggleChat() {
+	if a.chatPane == nil {
+		return
+	}
+	if a.chatVisible {
+		a.chatVisible = false
+		a.mainLayout.ResizeItem(a.chatPane.root, 0, 0)
+		a.focusedPane = a.preChatFocus
+		a.chatPane.root.SetBorderColor(tcell.ColorDarkSlateGray)
+		a.updateFocus()
+	} else {
+		a.chatVisible = true
+		a.preChatFocus = a.focusedPane
+		a.mainLayout.ResizeItem(a.chatPane.root, 14, 0)
+		if !a.chatClient.Available() {
+			a.chatPane.setStatus("ANTHROPIC_API_KEY not set — chat unavailable")
+		}
+		a.focusedPane = FocusChat
+		a.updateFocus()
+	}
+}
+
+// buildChatSystemPrompt returns a system prompt with current workspace context.
+func (a *App) buildChatSystemPrompt() string {
+	var sb strings.Builder
+	sb.WriteString("You are a helpful assistant embedded in a Linear project management TUI. ")
+	sb.WriteString("Help the user understand and act on their issues. Be concise — answers will display in a narrow terminal pane.\n\n")
+
+	if a.selectedNavigation != nil {
+		teamName := a.selectedNavigation.Text
+		if a.selectedNavigation.IsTeam {
+			sb.WriteString(fmt.Sprintf("Team: %s\n", teamName))
+		} else if a.selectedNavigation.IsProject {
+			sb.WriteString(fmt.Sprintf("Project: %s\n", teamName))
+		}
+	}
+
+	if a.selectedCycle != nil {
+		sb.WriteString(fmt.Sprintf("Active cycle: %s\n", a.selectedCycle.Name))
+	}
+
+	a.issuesMu.RLock()
+	selectedIssue := a.selectedIssue
+	issues := make([]linearapi.Issue, len(a.issues))
+	copy(issues, a.issues)
+	a.issuesMu.RUnlock()
+
+	if selectedIssue != nil {
+		sb.WriteString(fmt.Sprintf("\nSelected issue: [%s] %s\n", selectedIssue.Identifier, selectedIssue.Title))
+		sb.WriteString(fmt.Sprintf("  Status: %s | Priority: %s", selectedIssue.State, priorityLabel(selectedIssue.Priority)))
+		if selectedIssue.Assignee != "" {
+			sb.WriteString(fmt.Sprintf(" | Assignee: %s", selectedIssue.Assignee))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(issues) > 0 {
+		limit := 60
+		if len(issues) < limit {
+			limit = len(issues)
+		}
+		sb.WriteString(fmt.Sprintf("\nCurrent view (%d issues):\n", len(issues)))
+		for _, iss := range issues[:limit] {
+			sb.WriteString(fmt.Sprintf("  [%s] %s — %s\n", iss.Identifier, iss.Title, iss.State))
+		}
+		if len(issues) > limit {
+			sb.WriteString(fmt.Sprintf("  ...and %d more\n", len(issues)-limit))
+		}
+	}
+
+	return sb.String()
+}
+
+// handleChatSubmit processes a user message and streams the AI reply.
+func (a *App) handleChatSubmit(text string) {
+	if a.chatPane == nil || a.chatPane.Busy {
+		return
+	}
+	if !a.chatClient.Available() {
+		a.chatPane.addError("ANTHROPIC_API_KEY not set")
+		return
+	}
+
+	a.chatPane.addUser(text)
+	a.chatPane.Busy = true
+	a.chatHistory = append(a.chatHistory, agents.ChatMessage{Role: "user", Content: text})
+
+	system := a.buildChatSystemPrompt()
+
+	a.chatPane.startAssistant()
+
+	a.chatClient.Stream(
+		context.Background(),
+		system,
+		a.chatHistory,
+		func(token string) {
+			a.queueUpdateDraw(func() {
+				a.chatPane.appendToken(token)
+			})
+		},
+		func(full string, err error) {
+			a.queueUpdateDraw(func() {
+				if err != nil {
+					a.chatPane.addError(err.Error())
+					return
+				}
+				a.chatHistory = append(a.chatHistory, agents.ChatMessage{Role: "assistant", Content: full})
+				a.chatPane.finalizeAssistant(full)
+			})
+		},
+	)
 }
 
 // updateAllPaneTitles updates all pane titles with visual indicators for the active pane.
