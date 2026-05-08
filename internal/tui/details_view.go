@@ -111,6 +111,12 @@ func (a *App) updateDetailsView() {
 	hasComments := selectedIssue != nil && len(selectedIssue.Comments) > 0
 	a.setDetailsCommentsVisibility(hasComments)
 	if selectedIssue == nil {
+		// Show cycle details when a cycle is selected and no issue is focused
+		if a.selectedNavigation != nil && a.selectedNavigation.IsCycle && a.selectedCycle != nil {
+			a.updateCycleDetailsView(a.selectedCycle)
+			return
+		}
+		a.detailsDescriptionView.SetTitle(" Details ")
 		a.detailsDescriptionView.SetText(fmt.Sprintf("%sNo issue selected. Select an issue from the list to view details.[-]", a.themeTags.SecondaryText))
 		a.detailsCommentsView.SetText("")
 		if a.focusedPane == FocusDetails && !a.detailsCommentsVisible {
@@ -120,6 +126,7 @@ func (a *App) updateDetailsView() {
 	}
 
 	issue := selectedIssue
+	a.detailsDescriptionView.SetTitle(" Details ")
 
 	// Helper to colorize keys
 	keyColor := a.themeTags.SecondaryText
@@ -306,6 +313,84 @@ func (a *App) updateDetailsView() {
 	if a.focusedPane == FocusDetails && !a.detailsCommentsVisible {
 		a.updateFocus()
 	}
+}
+
+// updateCycleDetailsView renders cycle metadata in the details panel.
+// Called when a cycle node is selected in the navigation tree and no issue is focused.
+func (a *App) updateCycleDetailsView(cycle *linearapi.Cycle) {
+	if a.detailsDescriptionView == nil {
+		return
+	}
+	a.setDetailsCommentsVisibility(false)
+
+	keyColor := a.themeTags.SecondaryText
+	valColor := a.themeTags.Foreground
+	accentColor := a.themeTags.Accent
+	dividerColor := a.themeTags.Border
+
+	var lines []string
+
+	lines = append(lines, fmt.Sprintf("%s%s[-]", accentColor, cycle.DisplayName()))
+	lines = append(lines, "")
+
+	if !cycle.StartsAt.IsZero() {
+		lines = append(lines, fmt.Sprintf("%sDates:[-]     %s%s → %s[-]",
+			keyColor, valColor,
+			cycle.StartsAt.Format("Jan 2, 2006"),
+			cycle.EndsAt.Format("Jan 2, 2006")))
+	}
+
+	lines = append(lines, fmt.Sprintf("%sProgress:[-]  %s%d%%[-]", keyColor, valColor, cycle.ProgressPercent()))
+
+	// Burndown bar
+	burndown := buildCycleBurndownText(cycle, 24)
+	if burndown != "" {
+		lines = append(lines, "")
+		lines = append(lines, fmt.Sprintf("%s%s[-]", valColor, burndown))
+	}
+
+	// Issue breakdown by state
+	a.issuesMu.RLock()
+	issues := make([]linearapi.Issue, len(a.issues))
+	copy(issues, a.issues)
+	a.issuesMu.RUnlock()
+
+	if len(issues) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, fmt.Sprintf("%s────────────────[-]", dividerColor))
+		lines = append(lines, "")
+
+		stateCounts := map[string]int{}
+		stateOrder := []string{}
+		seen := map[string]bool{}
+		for _, iss := range issues {
+			if !seen[iss.State] {
+				stateOrder = append(stateOrder, iss.State)
+				seen[iss.State] = true
+			}
+			stateCounts[iss.State]++
+		}
+		for _, st := range stateOrder {
+			lines = append(lines, fmt.Sprintf("  %s%s[-]  %s%d[-]", keyColor, st, valColor, stateCounts[st]))
+		}
+
+		breakdown := buildAssigneeBreakdown(issues)
+		if breakdown != "" {
+			lines = append(lines, "")
+			lines = append(lines, fmt.Sprintf("%s────────────────[-]", dividerColor))
+			lines = append(lines, "")
+			for _, part := range strings.Split(breakdown, "  |  ") {
+				lines = append(lines, "  "+strings.TrimSpace(part))
+			}
+		}
+
+		lines = append(lines, "")
+		lines = append(lines, fmt.Sprintf("%s[K] open kanban view[-]", keyColor))
+	}
+
+	a.detailsDescriptionView.SetTitle(" Cycle ")
+	a.detailsDescriptionView.SetText(strings.Join(lines, "\n"))
+	a.detailsDescriptionView.ScrollToBeginning()
 }
 
 // filterGitHubAttachments returns attachments that are GitHub PR links.

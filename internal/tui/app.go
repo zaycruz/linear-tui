@@ -71,6 +71,7 @@ type App struct {
 	velocityModal          *VelocityModal
 	statsModal             *StatsModal
 	triageModal            *TriageModal
+	cycleKanban            *CycleKanbanModal
 	chatPane               *ChatPane
 	chatClient             *agents.ChatClient
 	chatVisible            bool
@@ -770,10 +771,12 @@ func (a *App) buildLayout() {
 	a.velocityModal = NewVelocityModal(a)
 	a.statsModal = NewStatsModal(a)
 	a.triageModal = NewTriageModal(a)
+	a.cycleKanban = NewCycleKanbanModal(a)
 
 	// Add main layout to pages
 	a.pages.AddPage("main", a.mainLayout, true, true)
 	a.pages.AddPage("palette", a.paletteModal, true, false)
+	a.pages.AddPage("cycle_kanban", a.cycleKanban.root, true, false)
 
 	// Set initial focus
 	a.updateFocus()
@@ -855,6 +858,13 @@ func (a *App) bindGlobalKeys() {
 		// Check if triage modal is visible and handle its keys
 		if a.pages.HasPage("triage") && a.triageModal != nil {
 			return a.triageModal.HandleKey(event)
+		}
+
+		// Check if cycle kanban is visible and handle its keys
+		if name, _ := a.pages.GetFrontPage(); name == "cycle_kanban" {
+			if a.cycleKanban != nil {
+				return a.cycleKanban.HandleKey(event)
+			}
 		}
 
 		// When chat pane is focused, intercept control keys; pass typing through to the input field.
@@ -966,6 +976,9 @@ func (a *App) bindGlobalKeys() {
 				return nil
 			case '?':
 				a.toggleChat()
+				return nil
+			case 'K':
+				a.openCycleKanban()
 				return nil
 			}
 		}
@@ -1422,6 +1435,19 @@ HOW TO BEHAVE:
 	return sb.String()
 }
 
+// openCycleKanban opens the kanban modal for the current cycle.
+// Safe to call from anywhere (checks nil and non-cycle navigation).
+func (a *App) openCycleKanban() {
+	if a.cycleKanban == nil {
+		return
+	}
+	a.issuesMu.RLock()
+	issues := make([]linearapi.Issue, len(a.issues))
+	copy(issues, a.issues)
+	a.issuesMu.RUnlock()
+	a.cycleKanban.Show(a.selectedCycle, issues, a.workflowStates)
+}
+
 // handleChatSubmit processes a user message and streams the AI reply.
 func (a *App) handleChatSubmit(text string) {
 	if a.chatPane == nil || a.chatPane.Busy {
@@ -1776,11 +1802,18 @@ func (a *App) refreshIssuesWithFocusChange(allowFocusChange bool, issueID ...str
 func (a *App) updateIssuesColumnLayout() {
 	a.issuesColumn.Clear()
 
-	// Show burndown panel when in cycle view
+	// Show burndown panel when in cycle view; refresh cycle details panel too
 	inCycleView := a.selectedNavigation != nil && a.selectedNavigation.IsCycle
 	if inCycleView && a.burndownPanel != nil {
 		a.updateBurndownPanel()
 		a.issuesColumn.AddItem(a.burndownPanel, 3, 0, false)
+		// Refresh cycle details in the right panel if no issue is focused
+		a.issuesMu.RLock()
+		noIssueSelected := a.selectedIssue == nil
+		a.issuesMu.RUnlock()
+		if noIssueSelected && a.selectedCycle != nil {
+			a.updateCycleDetailsView(a.selectedCycle)
+		}
 	}
 
 	// Add My Issues table if there are any

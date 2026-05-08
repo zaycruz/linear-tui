@@ -151,7 +151,7 @@ var toolDefs = []map[string]interface{}{
 			"parameters": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"panel": prop("string", "One of: velocity, stats, triage, fuzzy_finder"),
+					"panel": prop("string", "One of: velocity, stats, triage, fuzzy_finder, kanban"),
 				},
 				"required": []string{"panel"},
 			},

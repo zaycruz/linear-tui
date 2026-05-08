@@ -326,6 +326,8 @@ func (e *AppExecutor) NavOpenOverlay(panel string) {
 			if e.app.fuzzyFinder != nil {
 				e.app.fuzzyFinder.Show()
 			}
+		case "kanban":
+			e.app.openCycleKanban()
 		}
 	})
 }
