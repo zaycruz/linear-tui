@@ -220,33 +220,45 @@ func DefaultCommands(app *App) []Command {
 				if issue == nil || issue.URL == "" {
 					return
 				}
-				_ = openURL(issue.URL)
-			},
-		},
-		{
-			ID:           "copy_id",
-			Title:        "Copy issue ID",
-			Keywords:     []string{"copy", "id", "c", "identifier"},
-			ShortcutRune: 'y',
-			Run: func(a *App) {
-				issue := a.GetSelectedIssue()
-				if issue == nil {
-					return
+				if err := openURL(issue.URL); err != nil {
+					a.updateStatusBarWithError(err)
+				} else {
+					a.statusBar.SetText(fmt.Sprintf("%sOpened in browser[-]", a.themeTags.Accent))
 				}
-				_ = copyToClipboard(issue.Identifier)
 			},
 		},
 		{
 			ID:           "copy_url",
 			Title:        "Copy issue URL",
-			Keywords:     []string{"copy", "url", "link"},
-			ShortcutRune: 'w', // 'w' for web URL
+			Keywords:     []string{"copy", "url", "link", "y"},
+			ShortcutRune: 'y',
 			Run: func(a *App) {
 				issue := a.GetSelectedIssue()
 				if issue == nil || issue.URL == "" {
 					return
 				}
-				_ = copyToClipboard(issue.URL)
+				if err := copyToClipboard(issue.URL); err != nil {
+					a.updateStatusBarWithError(err)
+				} else {
+					a.statusBar.SetText(fmt.Sprintf("%sCopied: %s[-]", a.themeTags.Accent, issue.URL))
+				}
+			},
+		},
+		{
+			ID:           "copy_id",
+			Title:        "Copy issue identifier",
+			Keywords:     []string{"copy", "id", "c", "identifier"},
+			ShortcutRune: 'c',
+			Run: func(a *App) {
+				issue := a.GetSelectedIssue()
+				if issue == nil {
+					return
+				}
+				if err := copyToClipboard(issue.Identifier); err != nil {
+					a.updateStatusBarWithError(err)
+				} else {
+					a.statusBar.SetText(fmt.Sprintf("%sCopied: %s[-]", a.themeTags.Accent, issue.Identifier))
+				}
 			},
 		},
 		{
@@ -379,7 +391,8 @@ func DefaultCommands(app *App) []Command {
 				if issue == nil {
 					return
 				}
-				a.ShowUserPicker(func(userID string) {
+				// ShowUserPickerWithUnassign includes "Unassign" option at top
+				a.ShowUserPickerWithUnassign(func(userID string) {
 					go func() {
 						ctx := context.Background()
 						_, err := a.GetAPI().UpdateIssue(ctx, linearapi.UpdateIssueInput{
@@ -392,7 +405,7 @@ func DefaultCommands(app *App) []Command {
 								a.updateStatusBarWithError(err)
 								return
 							}
-							logger.Info("tui.commands: assigned issue to user issue=%s", issue.Identifier)
+							logger.Info("tui.commands: assigned/unassigned issue issue=%s", issue.Identifier)
 							go a.refreshIssues(issue.ID)
 						})
 					}()
@@ -417,7 +430,7 @@ func DefaultCommands(app *App) []Command {
 			ID:           "edit_title",
 			Title:        "Edit issue title",
 			Keywords:     []string{"edit", "title", "rename"},
-			ShortcutRune: 'e',
+			ShortcutRune: 'T', // Changed to capital T to free 'e' for estimate
 			Run: func(a *App) {
 				issue := a.GetSelectedIssue()
 				if issue == nil {
@@ -430,13 +443,46 @@ func DefaultCommands(app *App) []Command {
 			ID:           "edit_labels",
 			Title:        "Edit issue labels",
 			Keywords:     []string{"labels", "label", "tag", "tags"},
-			ShortcutRune: 'g', // 'g' for tags (since 'l' is used for vim navigation)
+			ShortcutRune: 'f', // 'f' for flags/labels
 			Run: func(a *App) {
 				issue := a.GetSelectedIssue()
 				if issue == nil {
 					return
 				}
 				a.ShowEditLabelsModal()
+			},
+		},
+		{
+			ID:           "git_checkout",
+			Title:        "Checkout git branch",
+			Keywords:     []string{"git", "checkout", "branch", "g"},
+			ShortcutRune: 'g',
+			Run: func(a *App) {
+				issue := a.GetSelectedIssue()
+				if issue == nil {
+					return
+				}
+				workspace := strings.TrimSpace(a.config.AgentWorkspace)
+				if workspace == "" {
+					a.updateStatusBarWithError(fmt.Errorf("agent_workspace not configured in ~/.linear-tui/config.json"))
+					return
+				}
+				branchName := strings.TrimSpace(issue.GitBranchName)
+				if branchName == "" {
+					branchName = slugifyBranchName(issue.Identifier, issue.Title)
+				}
+				go func() {
+					err := checkoutGitBranch(branchName, workspace)
+					a.QueueUpdateDraw(func() {
+						if err != nil {
+							logger.ErrorWithErr(err, "tui.commands: git checkout failed branch=%s workspace=%s", branchName, workspace)
+							a.updateStatusBarWithError(fmt.Errorf("git checkout -b %s: %v", branchName, err))
+							return
+						}
+						logger.Info("tui.commands: git checkout succeeded branch=%s", branchName)
+						a.statusBar.SetText(fmt.Sprintf("%sBranch checked out: %s[-]", a.themeTags.Accent, branchName))
+					})
+				}()
 			},
 		},
 		{
@@ -456,7 +502,7 @@ func DefaultCommands(app *App) []Command {
 			ID:           "view_parent",
 			Title:        "View parent issue",
 			Keywords:     []string{"parent", "up", "back"},
-			ShortcutRune: 'p',
+			ShortcutRune: 'P', // Changed to capital P to free 'p' for priority
 			Run: func(a *App) {
 				issue := a.GetSelectedIssue()
 				if issue == nil || issue.Parent == nil {
@@ -631,7 +677,7 @@ func DefaultCommands(app *App) []Command {
 			ID:           "remove_parent",
 			Title:        "Remove parent",
 			Keywords:     []string{"remove", "parent", "unlink", "top"},
-			ShortcutRune: 'd',
+			ShortcutRune: 'D', // Changed to capital D to free 'd' for due date
 			Run: func(a *App) {
 				issue := a.GetSelectedIssue()
 				if issue == nil || issue.Parent == nil {
@@ -667,6 +713,445 @@ func DefaultCommands(app *App) []Command {
 					return
 				}
 				a.createCommentModal.Show(issue.ID, a.handleCreateComment)
+			},
+		},
+		{
+			ID:       "start_cycle",
+			Title:    "Start Cycle",
+			Keywords: []string{"cycle", "start", "sprint"},
+			Run: func(a *App) {
+				cyc := a.selectedCycle
+				if cyc == nil {
+					a.updateStatusBarWithError(fmt.Errorf("no cycle selected"))
+					return
+				}
+				cycleID := cyc.ID
+				teamID := ""
+				if a.selectedNavigation != nil {
+					teamID = a.selectedNavigation.TeamID
+				}
+				go func() {
+					ctx := context.Background()
+					err := a.GetAPI().StartCycle(ctx, cycleID)
+					a.QueueUpdateDraw(func() {
+						if err != nil {
+							logger.ErrorWithErr(err, "tui.commands: failed to start cycle cycle_id=%s", cycleID)
+							a.updateStatusBarWithError(err)
+							return
+						}
+						logger.Info("tui.commands: started cycle cycle_id=%s", cycleID)
+						// Invalidate cycles cache so the sidebar refreshes on next expand
+						if teamID != "" {
+							a.cache.InvalidateCycles(teamID)
+						}
+						a.updateStatusBar()
+					})
+				}()
+			},
+		},
+		{
+			ID:       "add_to_cycle",
+			Title:    "Add Issue to Cycle",
+			Keywords: []string{"cycle", "add", "sprint", "assign cycle"},
+			Run: func(a *App) {
+				issue := a.GetSelectedIssue()
+				if issue == nil {
+					a.updateStatusBarWithError(fmt.Errorf("no issue selected"))
+					return
+				}
+				issueID := issue.ID
+				issueIdentifier := issue.Identifier
+				a.ShowCyclePicker(func(cycleID string) {
+					go func() {
+						ctx := context.Background()
+						err := a.GetAPI().AddIssueToCycle(ctx, issueID, cycleID)
+						a.QueueUpdateDraw(func() {
+							if err != nil {
+								logger.ErrorWithErr(err, "tui.commands: failed to add issue to cycle issue=%s cycle_id=%s", issueIdentifier, cycleID)
+								a.updateStatusBarWithError(err)
+								return
+							}
+							logger.Info("tui.commands: added issue to cycle issue=%s cycle_id=%s", issueIdentifier, cycleID)
+							go a.refreshIssues(issueID)
+						})
+					}()
+				})
+			},
+		},
+		// Feature 1: Priority change
+		{
+			ID:           "change_priority",
+			Title:        "Change issue priority",
+			Keywords:     []string{"priority", "urgent", "high", "medium", "low"},
+			ShortcutRune: 'p',
+			Run: func(a *App) {
+				issue := a.GetSelectedIssue()
+				if issue == nil {
+					return
+				}
+				a.ShowPriorityPicker(func(priority int) {
+					go func() {
+						ctx := context.Background()
+						_, err := a.GetAPI().UpdateIssue(ctx, linearapi.UpdateIssueInput{
+							ID:       issue.ID,
+							Priority: &priority,
+						})
+						a.QueueUpdateDraw(func() {
+							if err != nil {
+								logger.ErrorWithErr(err, "tui.commands: failed to change priority issue=%s", issue.Identifier)
+								a.updateStatusBarWithError(err)
+								return
+							}
+							logger.Info("tui.commands: changed priority issue=%s priority=%d", issue.Identifier, priority)
+							go a.refreshIssues(issue.ID)
+						})
+					}()
+				})
+			},
+		},
+		// Feature 3: Estimate set
+		{
+			ID:           "set_estimate",
+			Title:        "Set story point estimate",
+			Keywords:     []string{"estimate", "points", "story", "size"},
+			ShortcutRune: 'e',
+			Run: func(a *App) {
+				issue := a.GetSelectedIssue()
+				if issue == nil {
+					return
+				}
+				a.ShowEstimatePicker(func(estimate *float64) {
+					go func() {
+						ctx := context.Background()
+						// When estimate is nil (Clear), set to 0 to clear
+						var updateEstimate *float64
+						if estimate != nil {
+							updateEstimate = estimate
+						} else {
+							zero := 0.0
+							updateEstimate = &zero
+						}
+						_, err := a.GetAPI().UpdateIssue(ctx, linearapi.UpdateIssueInput{
+							ID:       issue.ID,
+							Estimate: updateEstimate,
+						})
+						a.QueueUpdateDraw(func() {
+							if err != nil {
+								logger.ErrorWithErr(err, "tui.commands: failed to set estimate issue=%s", issue.Identifier)
+								a.updateStatusBarWithError(err)
+								return
+							}
+							logger.Info("tui.commands: set estimate issue=%s", issue.Identifier)
+							go a.refreshIssues(issue.ID)
+						})
+					}()
+				})
+			},
+		},
+		// Feature 4: Due date set
+		{
+			ID:           "set_due_date",
+			Title:        "Set due date",
+			Keywords:     []string{"due", "date", "deadline", "duedate"},
+			ShortcutRune: 'd',
+			Run: func(a *App) {
+				issue := a.GetSelectedIssue()
+				if issue == nil {
+					return
+				}
+				currentDate := issue.DueDate
+				a.ShowDueDateModal(issue.ID, currentDate, func(issueID, date string) {
+					go func() {
+						ctx := context.Background()
+						// "clear" or empty string = clear due date
+						var dueDate string
+						if strings.ToLower(strings.TrimSpace(date)) == "clear" {
+							dueDate = ""
+						} else {
+							dueDate = strings.TrimSpace(date)
+						}
+						_, err := a.GetAPI().UpdateIssue(ctx, linearapi.UpdateIssueInput{
+							ID:      issueID,
+							DueDate: &dueDate,
+						})
+						a.QueueUpdateDraw(func() {
+							if err != nil {
+								logger.ErrorWithErr(err, "tui.commands: failed to set due date issue=%s", issueID)
+								a.updateStatusBarWithError(err)
+								return
+							}
+							logger.Info("tui.commands: set due date issue=%s date=%s", issueID, dueDate)
+							go a.refreshIssues(issueID)
+						})
+					}()
+				})
+			},
+		},
+		// Feature 6: Create relation
+		{
+			ID:       "create_relation",
+			Title:    "Create issue relation",
+			Keywords: []string{"relation", "link", "blocks", "duplicate", "related"},
+			Run: func(a *App) {
+				issue := a.GetSelectedIssue()
+				if issue == nil {
+					a.updateStatusBarWithError(fmt.Errorf("no issue selected"))
+					return
+				}
+				a.ShowRelationModal(issue.ID, func(issueID, relatedIssueID, relationType string) {
+					go func() {
+						ctx := context.Background()
+						err := a.GetAPI().CreateIssueRelation(ctx, issueID, relatedIssueID, relationType)
+						a.QueueUpdateDraw(func() {
+							if err != nil {
+								logger.ErrorWithErr(err, "tui.commands: failed to create relation issue=%s", issue.Identifier)
+								a.updateStatusBarWithError(err)
+								return
+							}
+							logger.Info("tui.commands: created relation issue=%s type=%s", issue.Identifier, relationType)
+							go a.refreshIssues(issueID)
+						})
+					}()
+				})
+			},
+		},
+		// Feature 7: Bulk status change
+		{
+			ID:       "bulk_status_change",
+			Title:    "Bulk: change status for selected issues",
+			Keywords: []string{"bulk", "status", "multiple"},
+			Run: func(a *App) {
+				if len(a.selectedIssueIDs) == 0 {
+					a.updateStatusBarWithError(fmt.Errorf("no issues selected (use Space to select)"))
+					return
+				}
+				issueIDs := make([]string, 0, len(a.selectedIssueIDs))
+				for id := range a.selectedIssueIDs {
+					issueIDs = append(issueIDs, id)
+				}
+				a.ShowStatusPicker(func(stateID string) {
+					go func() {
+						ctx := context.Background()
+						for _, issueID := range issueIDs {
+							id := issueID
+							_, err := a.GetAPI().UpdateIssue(ctx, linearapi.UpdateIssueInput{
+								ID:      id,
+								StateID: &stateID,
+							})
+							if err != nil {
+								logger.ErrorWithErr(err, "tui.commands: bulk status change failed issue_id=%s", id)
+							}
+						}
+						a.QueueUpdateDraw(func() {
+							logger.Info("tui.commands: bulk status change applied count=%d", len(issueIDs))
+							a.ClearBulkSelect()
+							go a.refreshIssues()
+						})
+					}()
+				})
+			},
+		},
+		// Feature 7: Bulk add to cycle
+		{
+			ID:       "bulk_add_to_cycle",
+			Title:    "Bulk: add selected issues to cycle",
+			Keywords: []string{"bulk", "cycle", "sprint", "multiple"},
+			Run: func(a *App) {
+				if len(a.selectedIssueIDs) == 0 {
+					a.updateStatusBarWithError(fmt.Errorf("no issues selected (use Space to select)"))
+					return
+				}
+				issueIDs := make([]string, 0, len(a.selectedIssueIDs))
+				for id := range a.selectedIssueIDs {
+					issueIDs = append(issueIDs, id)
+				}
+				a.ShowCyclePicker(func(cycleID string) {
+					go func() {
+						ctx := context.Background()
+						for _, issueID := range issueIDs {
+							err := a.GetAPI().AddIssueToCycle(ctx, issueID, cycleID)
+							if err != nil {
+								logger.ErrorWithErr(err, "tui.commands: bulk add to cycle failed issue_id=%s cycle_id=%s", issueID, cycleID)
+							}
+						}
+						a.QueueUpdateDraw(func() {
+							logger.Info("tui.commands: bulk add to cycle applied count=%d cycle_id=%s", len(issueIDs), cycleID)
+							a.ClearBulkSelect()
+							go a.refreshIssues()
+						})
+					}()
+				})
+			},
+		},
+		// Feature 7: Bulk assign
+		{
+			ID:       "bulk_assign",
+			Title:    "Bulk: assign selected issues to user",
+			Keywords: []string{"bulk", "assign", "multiple"},
+			Run: func(a *App) {
+				if len(a.selectedIssueIDs) == 0 {
+					a.updateStatusBarWithError(fmt.Errorf("no issues selected (use Space to select)"))
+					return
+				}
+				issueIDs := make([]string, 0, len(a.selectedIssueIDs))
+				for id := range a.selectedIssueIDs {
+					issueIDs = append(issueIDs, id)
+				}
+				a.ShowUserPickerWithUnassign(func(userID string) {
+					go func() {
+						ctx := context.Background()
+						for _, issueID := range issueIDs {
+							id := issueID
+							_, err := a.GetAPI().UpdateIssue(ctx, linearapi.UpdateIssueInput{
+								ID:         id,
+								AssigneeID: &userID,
+							})
+							if err != nil {
+								logger.ErrorWithErr(err, "tui.commands: bulk assign failed issue_id=%s", id)
+							}
+						}
+						a.QueueUpdateDraw(func() {
+							logger.Info("tui.commands: bulk assign applied count=%d", len(issueIDs))
+							a.ClearBulkSelect()
+							go a.refreshIssues()
+						})
+					}()
+				})
+			},
+		},
+		// Feature 8: Mark notification as read
+		{
+			ID:       "mark_read",
+			Title:    "Mark notification as read",
+			Keywords: []string{"mark", "read", "notification"},
+			Run: func(a *App) {
+				if !a.inNotificationsView || len(a.notifications) == 0 {
+					return
+				}
+				// Get selected row from otherIssuesTable (used for notifications)
+				row, _ := a.otherIssuesTable.GetSelection()
+				notifIdx := row - 1 // Subtract header row
+				if notifIdx < 0 || notifIdx >= len(a.notifications) {
+					return
+				}
+				notif := a.notifications[notifIdx]
+				if notif.ReadAt != "" {
+					return // Already read
+				}
+				go func() {
+					ctx := context.Background()
+					err := a.GetAPI().MarkNotificationRead(ctx, notif.ID)
+					a.QueueUpdateDraw(func() {
+						if err != nil {
+							logger.ErrorWithErr(err, "tui.commands: failed to mark notification read notification_id=%s", notif.ID)
+							a.updateStatusBarWithError(err)
+							return
+						}
+						logger.Info("tui.commands: marked notification read notification_id=%s", notif.ID)
+						// Refresh notifications
+						a.LoadAndShowNotifications()
+					})
+				}()
+			},
+		},
+		// velocity: show velocity chart overlay
+		{
+			ID:       "velocity",
+			Title:    "Velocity chart (last 6 cycles)",
+			Keywords: []string{"velocity", "chart", "cycles", "sprint"},
+			Run: func(a *App) {
+				if len(a.cycles) == 0 {
+					a.updateStatusBarWithError(fmt.Errorf("no cycles available — select a team first"))
+					return
+				}
+				teamName := ""
+				if a.selectedNavigation != nil {
+					teamName = a.selectedNavigation.Text
+					if a.selectedNavigation.TeamID != "" {
+						// Use team name from navigation
+						teamName = a.selectedNavigation.Text
+					}
+				}
+				if a.velocityModal == nil {
+					a.velocityModal = NewVelocityModal(a)
+				}
+				a.velocityModal.Show(a.cycles, teamName)
+			},
+		},
+		// stats: show team throughput stats overlay
+		{
+			ID:       "stats",
+			Title:    "Team throughput stats",
+			Keywords: []string{"stats", "throughput", "opened", "closed"},
+			Run: func(a *App) {
+				a.issuesMu.RLock()
+				issues := a.issues
+				a.issuesMu.RUnlock()
+				teamName := ""
+				if a.selectedNavigation != nil {
+					teamName = a.selectedNavigation.Text
+				}
+				if a.statsModal == nil {
+					a.statsModal = NewStatsModal(a)
+				}
+				a.statsModal.Show(issues, teamName)
+			},
+		},
+		// export_cycle: generate markdown cycle report and copy to clipboard
+		{
+			ID:       "export_cycle",
+			Title:    "Export cycle report to clipboard",
+			Keywords: []string{"export", "cycle", "report", "markdown"},
+			Run: func(a *App) {
+				cyc := a.selectedCycle
+				if cyc == nil {
+					a.updateStatusBarWithError(fmt.Errorf("no cycle selected — navigate to a cycle first"))
+					return
+				}
+				a.issuesMu.RLock()
+				issues := a.issues
+				a.issuesMu.RUnlock()
+				report := buildCycleReport(cyc, issues, a.teamProjects)
+				if err := copyToClipboard(report); err != nil {
+					logger.ErrorWithErr(err, "tui.commands: export_cycle clipboard failed")
+					a.updateStatusBarWithError(err)
+					return
+				}
+				logger.Info("tui.commands: cycle report copied to clipboard cycle=%s", cyc.DisplayName())
+				a.statusBar.SetText(fmt.Sprintf("%sCycle report copied to clipboard[-]", a.themeTags.Accent))
+			},
+		},
+		// triage: rapid-fire backlog grooming
+		{
+			ID:       "triage",
+			Title:    "Triage mode (rapid backlog grooming)",
+			Keywords: []string{"triage", "groom", "backlog"},
+			Run: func(a *App) {
+				a.issuesMu.RLock()
+				issues := a.issues
+				a.issuesMu.RUnlock()
+				if a.triageModal == nil {
+					a.triageModal = NewTriageModal(a)
+				}
+				a.triageModal.Start(issues)
+			},
+		},
+		// save_view: save current filters as a named view
+		{
+			ID:       "save_view",
+			Title:    "Save current view as named filter",
+			Keywords: []string{"save", "view", "filter", "named"},
+			Run: func(a *App) {
+				a.promptSaveView()
+			},
+		},
+		// delete_view: delete a saved view
+		{
+			ID:       "delete_view",
+			Title:    "Delete a saved view",
+			Keywords: []string{"delete", "view", "remove"},
+			Run: func(a *App) {
+				a.promptDeleteView()
 			},
 		},
 	}
@@ -705,6 +1190,43 @@ func openURL(url string) error {
 
 	logger.Debug("tui.commands: opened URL in browser url=%s", url)
 	return nil
+}
+
+// checkoutGitBranch runs `git checkout -b <branchName>` in workspace.
+func checkoutGitBranch(branchName, workspace string) error {
+	cmd := exec.Command("git", "checkout", "-b", branchName)
+	cmd.Dir = workspace
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// slugifyBranchName produces a safe git branch name from an issue identifier and title.
+// Format: <identifier>-<slug> where slug replaces non-alphanumeric chars with '-'
+// and the whole result is truncated to 50 characters.
+func slugifyBranchName(identifier, title string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(identifier + "-" + title) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	result := b.String()
+	// Collapse multiple consecutive dashes
+	for strings.Contains(result, "--") {
+		result = strings.ReplaceAll(result, "--", "-")
+	}
+	// Trim leading/trailing dashes
+	result = strings.Trim(result, "-")
+	if len(result) > 50 {
+		result = result[:50]
+		result = strings.TrimRight(result, "-")
+	}
+	return result
 }
 
 // copyToClipboard copies text to the system clipboard.

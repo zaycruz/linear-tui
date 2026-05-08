@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
@@ -47,13 +48,17 @@ func (a *App) getRowForIssue(issueID string) int {
 }
 
 // getIssueFromRowModel returns the issue for a given table row using the provided model.
-// Returns nil if the row is invalid.
+// Returns nil if the row is invalid or is a project group header row.
 func getIssueFromRowModel(row int, rows []IssueRow, idToIssue map[string]*linearapi.Issue) *linearapi.Issue {
 	rowIndex := row - 1 // Account for header row
 	if rowIndex < 0 || rowIndex >= len(rows) {
 		return nil
 	}
-	issueID := rows[rowIndex].IssueID
+	issueRow := rows[rowIndex]
+	if issueRow.IsProjectHeader {
+		return nil
+	}
+	issueID := issueRow.IssueID
 	if issue, ok := idToIssue[issueID]; ok {
 		return issue
 	}
@@ -270,13 +275,11 @@ func (a *App) setupIssuesTableNavigation(table *tview.Table, section IssuesSecti
 				}
 				return nil
 			case ' ':
-				// Space toggles expand/collapse
+				// Space toggles bulk selection for the focused issue
 				row, _ := table.GetSelection()
 				if issue := a.getIssueFromRowForSection(row, section); issue != nil {
-					if len(issue.Children) > 0 {
-						a.toggleIssueExpanded(issue.ID)
-						a.activeIssuesSection = section
-					}
+					a.ToggleBulkSelect(issue.ID)
+					a.activeIssuesSection = section
 				}
 				return nil
 			}
@@ -369,7 +372,12 @@ func (a *App) getRowForIssueInSection(issueID string, section IssuesSection) int
 }
 
 // renderIssuesTableModel renders a table with the given rows and issue lookup map.
-func renderIssuesTableModel(table *tview.Table, rows []IssueRow, idToIssue map[string]*linearapi.Issue, selectedIssueID string, theme Theme) {
+// selectedIDs is an optional map of issue IDs that are bulk-selected (shown with ✓ prefix).
+func renderIssuesTableModel(table *tview.Table, rows []IssueRow, idToIssue map[string]*linearapi.Issue, selectedIssueID string, theme Theme, selectedIDs ...map[string]bool) {
+	var bulkSelected map[string]bool
+	if len(selectedIDs) > 0 {
+		bulkSelected = selectedIDs[0]
+	}
 	table.Clear()
 
 	// Set column headers with better styling
@@ -408,6 +416,20 @@ func renderIssuesTableModel(table *tview.Table, rows []IssueRow, idToIssue map[s
 	for i, issueRow := range rows {
 		row := i + 1
 
+		// Render project group header rows (cycle view)
+		if issueRow.IsProjectHeader {
+			headerText := fmt.Sprintf(" ── %s ──────────────────────────────────────────", issueRow.ProjectName)
+			headerStyle := tcell.StyleDefault.
+				Foreground(theme.SecondaryText).
+				Dim(true)
+			table.SetCell(row, 0, tview.NewTableCell("").SetSelectable(false).SetStyle(headerStyle))
+			table.SetCell(row, 1, tview.NewTableCell("").SetSelectable(false).SetStyle(headerStyle))
+			table.SetCell(row, 2, tview.NewTableCell("").SetSelectable(false).SetStyle(headerStyle))
+			table.SetCell(row, 3, tview.NewTableCell("").SetSelectable(false).SetStyle(headerStyle))
+			table.SetCell(row, 4, tview.NewTableCell(headerText).SetSelectable(false).SetStyle(headerStyle))
+			continue
+		}
+
 		issue, ok := idToIssue[issueRow.IssueID]
 		if !ok || issue == nil {
 			continue
@@ -429,8 +451,16 @@ func renderIssuesTableModel(table *tview.Table, rows []IssueRow, idToIssue map[s
 			}
 		}
 
-		table.SetCell(row, 0, tview.NewTableCell(identifierPrefix+identifier).
-			SetTextColor(theme.SecondaryText).
+		// Show bulk selection indicator
+		idCellText := identifierPrefix + identifier
+		idCellColor := theme.SecondaryText
+		if bulkSelected != nil && bulkSelected[issue.ID] {
+			idCellText = "✓ " + identifier
+			idCellColor = theme.Accent
+		}
+
+		table.SetCell(row, 0, tview.NewTableCell(idCellText).
+			SetTextColor(idCellColor).
 			SetAlign(tview.AlignLeft))
 
 		// State with color based on state

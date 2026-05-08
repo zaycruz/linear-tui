@@ -3,10 +3,12 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/glamour"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"github.com/roeyazroel/linear-tui/internal/linearapi"
 )
 
 // markdownRenderer is a shared glamour renderer for markdown content.
@@ -145,7 +147,26 @@ func (a *App) updateDetailsView() {
 	}
 	headerLines = append(headerLines, fmt.Sprintf("%sAssignee:[-]   %s%s[-]", keyColor, valColor, assignee))
 
-	headerLines = append(headerLines, fmt.Sprintf("%sPriority:[-]   %s%d[-]", keyColor, valColor, issue.Priority))
+	headerLines = append(headerLines, fmt.Sprintf("%sPriority:[-]   %s%s[-]", keyColor, valColor, formatPriorityLabel(issue.Priority)))
+
+	// Estimate
+	if issue.Estimate != nil {
+		headerLines = append(headerLines, fmt.Sprintf("%sEstimate:[-]   %s%.0f pts[-]", keyColor, valColor, *issue.Estimate))
+	}
+
+	// Due date with overdue highlight
+	if issue.DueDate != "" {
+		dueDateDisplay := issue.DueDate
+		dueDateColor := valColor
+		// Check if overdue
+		if t, err := time.Parse("2006-01-02", issue.DueDate); err == nil {
+			if time.Now().After(t.AddDate(0, 0, 1)) { // past end of due date day
+				dueDateColor = a.themeTags.Error
+				dueDateDisplay = issue.DueDate + " (overdue)"
+			}
+		}
+		headerLines = append(headerLines, fmt.Sprintf("%sDue Date:[-]   %s%s[-]", keyColor, dueDateColor, dueDateDisplay))
+	}
 
 	// Labels
 	labelsText := "No labels"
@@ -178,6 +199,38 @@ func (a *App) updateDetailsView() {
 				keyColor, child.State,
 				valColor, child.Title)
 			headerLines = append(headerLines, childLine)
+		}
+	}
+
+	// GitHub PR links (from attachments)
+	githubAttachments := filterGitHubAttachments(issue.Attachments)
+	if len(githubAttachments) > 0 {
+		for i := 0; i < sectionGap; i++ {
+			headerLines = append(headerLines, "")
+		}
+		headerLines = append(headerLines, fmt.Sprintf("%sPull Requests:[-]", keyColor))
+		for _, att := range githubAttachments {
+			title := att.Title
+			if title == "" {
+				title = att.URL
+			}
+			headerLines = append(headerLines, fmt.Sprintf("  %s• %s[-] %s%s[-]", keyColor, title, accentColor, att.URL))
+		}
+	}
+
+	// Relations
+	if len(issue.Relations) > 0 {
+		for i := 0; i < sectionGap; i++ {
+			headerLines = append(headerLines, "")
+		}
+		headerLines = append(headerLines, fmt.Sprintf("%sRelations:[-]", keyColor))
+		for _, rel := range issue.Relations {
+			icon := relationIcon(rel.Type)
+			headerLines = append(headerLines, fmt.Sprintf("  %s%s %s[-] %s%s[-] %s%s[-] %s[%s][-]",
+				keyColor, icon, rel.Type,
+				accentColor, rel.RelatedIssue.Identifier,
+				valColor, rel.RelatedIssue.Title,
+				keyColor, rel.RelatedState))
 		}
 	}
 
@@ -254,3 +307,47 @@ func (a *App) updateDetailsView() {
 		a.updateFocus()
 	}
 }
+
+// filterGitHubAttachments returns attachments that are GitHub PR links.
+func filterGitHubAttachments(attachments []linearapi.IssueAttachment) []linearapi.IssueAttachment {
+	var result []linearapi.IssueAttachment
+	for _, att := range attachments {
+		if att.SourceType == "github" || strings.Contains(att.URL, "github.com/") {
+			result = append(result, att)
+		}
+	}
+	return result
+}
+
+// relationIcon returns an icon for a relation type.
+func relationIcon(relType string) string {
+	switch relType {
+	case "blocks":
+		return "⊃"
+	case "blocked":
+		return "⊂"
+	case "duplicate":
+		return "="
+	case "duplicateOf":
+		return "="
+	default:
+		return "~"
+	}
+}
+
+// formatPriorityLabel returns a human-readable priority label.
+func formatPriorityLabel(priority int) string {
+	switch priority {
+	case 1:
+		return "Urgent"
+	case 2:
+		return "High"
+	case 3:
+		return "Medium"
+	case 4:
+		return "Low"
+	default:
+		return "None"
+	}
+}
+

@@ -44,6 +44,7 @@ type App struct {
 	myIssuesTable          *tview.Table
 	otherIssuesTable       *tview.Table
 	issuesColumn           *tview.Flex     // Vertical flex containing My/Other tables
+	burndownPanel          *tview.TextView // Cycle burndown bar (shown in cycle view)
 	detailsView            *tview.Flex     // Flex container for details (description + comments)
 	detailsDescriptionView *tview.TextView // Scrollable description/metadata view
 	detailsCommentsView    *tview.TextView // Scrollable comments view
@@ -64,6 +65,20 @@ type App struct {
 	agentOutputModal       *AgentOutputModal
 	agentRunner            *agents.Runner
 	agentPromptTemplates   []config.AgentPromptTemplate
+	dueDateModal           *DueDateModal
+	relationModal          *RelationModal
+	fuzzyFinder            *FuzzyFinder
+	velocityModal          *VelocityModal
+	statsModal             *StatsModal
+	triageModal            *TriageModal
+
+	// Filter state for assignee / label
+	filterAssigneeMe bool   // when true, filter to current user's issues
+	filterLabelID    string // when set, filter to this label ID
+	filterLabelName  string // display name for status bar
+
+	// Saved views
+	savedViews []SavedView
 
 	// App state (protected by issuesMu)
 	issuesMu            sync.RWMutex
@@ -84,6 +99,13 @@ type App struct {
 	otherIDToIssue map[string]*linearapi.Issue // Quick lookup by issue ID for "Other Issues"
 	expandedState  map[string]bool             // Expanded state for parent issues (shared across sections)
 
+	// Bulk selection state
+	selectedIssueIDs map[string]bool
+
+	// Notifications view state
+	notifications        []linearapi.Notification
+	inNotificationsView  bool
+
 	// Filter/sort state
 	searchQuery string
 	sortField   SortField
@@ -92,6 +114,9 @@ type App struct {
 	currentUser    *linearapi.User
 	teamUsers      []linearapi.User
 	workflowStates []linearapi.WorkflowState
+	teamProjects   []linearapi.Project
+	cycles         []linearapi.Cycle
+	selectedCycle  *linearapi.Cycle
 
 	// Loading state
 	isLoading                      bool
@@ -152,6 +177,7 @@ func NewApp(api *linearapi.Client, cfg config.Config, templates []config.AgentPr
 		otherIDToIssue:       make(map[string]*linearapi.Issue),
 		activeIssuesSection:  IssuesSectionOther, // Default to Other section
 		agentPromptTemplates: templates,
+		selectedIssueIDs:     make(map[string]bool),
 	}
 
 	app.paletteCtrl = NewPaletteController(DefaultCommands(app))
@@ -159,6 +185,11 @@ func NewApp(api *linearapi.Client, cfg config.Config, templates []config.AgentPr
 	app.fetchIssueByID = api.FetchIssueByID
 	app.queueUpdateDraw = func(f func()) {
 		app.app.QueueUpdateDraw(f)
+	}
+
+	// Load saved views from disk (best-effort)
+	if views, err := loadSavedViews(); err == nil {
+		app.savedViews = views
 	}
 
 	app.applyThemeStyles()
@@ -327,6 +358,12 @@ func (a *App) rebuildModals() {
 	a.settingsModal = NewSettingsModal(a)
 	a.promptTemplatesModal = NewAgentPromptTemplatesModal(a)
 	a.agentPromptModal = NewAgentPromptModal(a)
+	a.dueDateModal = NewDueDateModal(a)
+	a.relationModal = NewRelationModal(a)
+	a.fuzzyFinder = NewFuzzyFinder(a)
+	a.velocityModal = NewVelocityModal(a)
+	a.statsModal = NewStatsModal(a)
+	a.triageModal = NewTriageModal(a)
 	if a.pages == nil || !a.pages.HasPage("agent_output") {
 		a.agentOutputModal = NewAgentOutputModal(a)
 	} else {
@@ -367,7 +404,7 @@ func (a *App) applyNavigationNodeColors(node *tview.TreeNode) {
 	if ref == nil {
 		node.SetColor(a.theme.Accent)
 	} else if navNode, ok := ref.(*NavigationNode); ok {
-		if navNode.IsProject || navNode.IsStatus {
+		if navNode.IsProject || navNode.IsStatus || navNode.IsCycle {
 			node.SetColor(a.theme.SecondaryText)
 		} else {
 			node.SetColor(a.theme.Foreground)
@@ -417,6 +454,9 @@ func (a *App) resetCachedState() {
 	a.currentUser = nil
 	a.teamUsers = nil
 	a.workflowStates = nil
+	a.teamProjects = nil
+	a.cycles = nil
+	a.selectedCycle = nil
 	a.activeIssuesSection = IssuesSectionOther
 	a.expandedState = make(map[string]bool)
 
@@ -475,6 +515,35 @@ func (a *App) rebuildNavigationTree(teams []linearapi.Team) {
 		SetExpanded(true)
 	root.AddChild(allIssues)
 
+	// Add "Saved Views" section if any exist
+	if len(a.savedViews) > 0 {
+		svGroup := tview.NewTreeNode("Saved Views").
+			SetColor(a.theme.Accent).
+			SetSelectable(false).
+			SetExpanded(true)
+		for i, sv := range a.savedViews {
+			svCopy := sv
+			idx := i
+			svNode := tview.NewTreeNode("  " + svCopy.Name).
+				SetColor(a.theme.SecondaryText).
+				SetReference(&NavigationNode{
+					ID:          fmt.Sprintf("saved_view_%d", idx),
+					Text:        svCopy.Name,
+					IsSavedView: true,
+					SavedView:   &svCopy,
+				})
+			svGroup.AddChild(svNode)
+		}
+		root.AddChild(svGroup)
+	}
+
+	// Add "Notifications" below All Issues
+	notificationsNode := tview.NewTreeNode("Notifications").
+		SetColor(a.theme.Foreground).
+		SetReference(&NavigationNode{ID: "notifications", Text: "Notifications", IsNotifications: true}).
+		SetExpanded(true)
+	root.AddChild(notificationsNode)
+
 	// Add teams
 	for _, team := range teams {
 		teamNode := tview.NewTreeNode(team.Name).
@@ -506,15 +575,16 @@ func (a *App) onTeamExpanded(teamID string, teamNode *tview.TreeNode) {
 		return
 	}
 
-	// Load projects and workflow states asynchronously
+	// Load projects, workflow states, and cycles asynchronously
 	go func() {
 		logger.Debug("tui.app: loading navigation children team_id=%s", teamID)
 		ctx := context.Background()
 		var projects []linearapi.Project
 		var states []linearapi.WorkflowState
-		var projectsErr, statesErr error
+		var cycles []linearapi.Cycle
+		var projectsErr, statesErr, cyclesErr error
 		var wg sync.WaitGroup
-		wg.Add(2)
+		wg.Add(3)
 		go func() {
 			defer wg.Done()
 			projects, projectsErr = a.cache.GetProjects(ctx, teamID)
@@ -522,6 +592,10 @@ func (a *App) onTeamExpanded(teamID string, teamNode *tview.TreeNode) {
 		go func() {
 			defer wg.Done()
 			states, statesErr = a.cache.GetWorkflowStates(ctx, teamID)
+		}()
+		go func() {
+			defer wg.Done()
+			cycles, cyclesErr = a.cache.GetCycles(ctx, teamID)
 		}()
 		wg.Wait()
 		if projectsErr != nil {
@@ -538,7 +612,11 @@ func (a *App) onTeamExpanded(teamID string, teamNode *tview.TreeNode) {
 			})
 			return
 		}
-		logger.Debug("tui.app: loaded navigation children team_id=%s projects=%d states=%d", teamID, len(projects), len(states))
+		if cyclesErr != nil {
+			logger.ErrorWithErr(cyclesErr, "tui.app: failed to load cycles team_id=%s", teamID)
+			// Non-fatal: log but don't bail out
+		}
+		logger.Debug("tui.app: loaded navigation children team_id=%s projects=%d states=%d cycles=%d", teamID, len(projects), len(states), len(cycles))
 
 		a.app.QueueUpdateDraw(func() {
 			// Double-check children haven't been added by another goroutine
@@ -585,6 +663,35 @@ func (a *App) onTeamExpanded(teamID string, teamNode *tview.TreeNode) {
 					})
 				teamNode.AddChild(projNode)
 			}
+			if len(cycles) > 0 {
+				cyclesGroup := tview.NewTreeNode("  Cycles").
+					SetColor(a.theme.SecondaryText).
+					SetSelectable(false).
+					SetReference(&NavigationNode{
+						ID:     fmt.Sprintf("%s-cycles", teamID),
+						Text:   "Cycles",
+						TeamID: teamID,
+					})
+				for _, cyc := range cycles {
+					label := fmt.Sprintf("    %s  %d%%", cyc.DisplayName(), cyc.ProgressPercent())
+					if !cyc.StartsAt.IsZero() && !cyc.EndsAt.IsZero() {
+						label += fmt.Sprintf("  %s→%s",
+							cyc.StartsAt.Format("Jan2"),
+							cyc.EndsAt.Format("Jan2"))
+					}
+					cycNode := tview.NewTreeNode(label).
+						SetColor(a.theme.SecondaryText).
+						SetReference(&NavigationNode{
+							ID:      cyc.ID,
+							Text:    cyc.DisplayName(),
+							TeamID:  teamID,
+							IsCycle: true,
+							CycleID: cyc.ID,
+						})
+					cyclesGroup.AddChild(cycNode)
+				}
+				teamNode.AddChild(cyclesGroup)
+			}
 			teamNode.SetExpanded(true)
 		})
 	}()
@@ -597,6 +704,8 @@ func (a *App) buildLayout() {
 	// Build My Issues and Other Issues tables
 	a.myIssuesTable = a.buildIssuesTable(" My Issues ", IssuesSectionMy)
 	a.otherIssuesTable = a.buildIssuesTable(" Other Issues ", IssuesSectionOther)
+	// Build the cycle burndown panel (hidden until a cycle is selected)
+	a.burndownPanel = buildBurndownPanel(a, nil)
 	// Create vertical flex for issues column
 	a.issuesColumn = tview.NewFlex().SetDirection(tview.FlexRow)
 	// Initially show only Other Issues table (My Issues will be added when issues are loaded)
@@ -632,6 +741,12 @@ func (a *App) buildLayout() {
 	a.agentPromptModal = NewAgentPromptModal(a)
 	a.agentOutputModal = NewAgentOutputModal(a)
 	a.agentRunner = agents.NewRunner()
+	a.dueDateModal = NewDueDateModal(a)
+	a.relationModal = NewRelationModal(a)
+	a.fuzzyFinder = NewFuzzyFinder(a)
+	a.velocityModal = NewVelocityModal(a)
+	a.statsModal = NewStatsModal(a)
+	a.triageModal = NewTriageModal(a)
 
 	// Add main layout to pages
 	a.pages.AddPage("main", a.mainLayout, true, true)
@@ -689,6 +804,36 @@ func (a *App) bindGlobalKeys() {
 			return a.agentOutputModal.HandleKey(event)
 		}
 
+		// Check if due date modal is visible and handle its keys
+		if a.pages.HasPage("due_date") && a.dueDateModal != nil {
+			return a.dueDateModal.HandleKey(event)
+		}
+
+		// Check if relation modal is visible and handle its keys
+		if a.pages.HasPage("relation") && a.relationModal != nil {
+			return a.relationModal.HandleKey(event)
+		}
+
+		// Check if fuzzy finder is visible and handle its keys
+		if a.pages.HasPage("fuzzy_finder") && a.fuzzyFinder != nil {
+			return a.fuzzyFinder.HandleKey(event)
+		}
+
+		// Check if velocity modal is visible and handle its keys
+		if a.pages.HasPage("velocity") && a.velocityModal != nil {
+			return a.velocityModal.HandleKey(event)
+		}
+
+		// Check if stats modal is visible and handle its keys
+		if a.pages.HasPage("stats") && a.statsModal != nil {
+			return a.statsModal.HandleKey(event)
+		}
+
+		// Check if triage modal is visible and handle its keys
+		if a.pages.HasPage("triage") && a.triageModal != nil {
+			return a.triageModal.HandleKey(event)
+		}
+
 		// Handle palette first if it's open
 		if a.focusedPane == FocusPalette {
 			return a.handlePaletteKey(event)
@@ -696,7 +841,17 @@ func (a *App) bindGlobalKeys() {
 
 		// Global shortcuts (only when not in palette)
 		switch event.Key() {
+		case tcell.KeyCtrlP:
+			if a.fuzzyFinder != nil {
+				a.fuzzyFinder.Show()
+			}
+			return nil
 		case tcell.KeyEscape:
+			// Clear bulk selection first if any
+			if len(a.selectedIssueIDs) > 0 {
+				a.ClearBulkSelect()
+				return nil
+			}
 			// Clear search if active (when not in modals/palette)
 			if a.searchQuery != "" {
 				a.setSearchQuery("")
@@ -824,6 +979,32 @@ func (a *App) handleIssuesKey(event *tcell.EventKey) *tcell.EventKey {
 			a.updateFocus()
 			return nil
 		}
+		// Handle Shift+A: toggle "filter to my issues"
+		if r == 'A' {
+			a.toggleFilterAssigneeMe()
+			return nil
+		}
+		// Handle Shift+Y: copy git branch name
+		if r == 'Y' {
+			issue := a.GetSelectedIssue()
+			if issue != nil {
+				branchName := issue.GitBranchName
+				if branchName == "" {
+					branchName = slugifyBranchName(issue.Identifier, issue.Title)
+				}
+				if err := copyToClipboard(branchName); err != nil {
+					a.updateStatusBarWithError(err)
+				} else {
+					a.statusBar.SetText(fmt.Sprintf("%sCopied: %s[-]", a.themeTags.Accent, branchName))
+				}
+			}
+			return nil
+		}
+		// Handle Shift+L: label filter
+		if r == 'L' {
+			a.showLabelFilterPicker()
+			return nil
+		}
 		// Handle command shortcuts (plain letters) - skip navigation keys
 		if r != 'j' && r != 'k' { // j/k are handled by table for up/down
 			for _, cmd := range a.paletteCtrl.commands {
@@ -835,6 +1016,52 @@ func (a *App) handleIssuesKey(event *tcell.EventKey) *tcell.EventKey {
 		}
 	}
 	return event
+}
+
+// toggleFilterAssigneeMe toggles the "my issues only" filter and refreshes.
+func (a *App) toggleFilterAssigneeMe() {
+	a.filterAssigneeMe = !a.filterAssigneeMe
+	a.updateStatusBar()
+	go a.refreshIssues()
+}
+
+// showLabelFilterPicker opens a label picker to set a label filter.
+func (a *App) showLabelFilterPicker() {
+	teamID := a.GetSelectedTeamID()
+	if teamID == "" {
+		a.updateStatusBarWithError(fmt.Errorf("no team selected"))
+		return
+	}
+	go func() {
+		ctx := context.Background()
+		labels, err := a.cache.GetIssueLabels(ctx, teamID)
+		if err != nil {
+			a.QueueUpdateDraw(func() {
+				a.updateStatusBarWithError(err)
+			})
+			return
+		}
+		a.QueueUpdateDraw(func() {
+			items := make([]PickerItem, 0, len(labels)+1)
+			items = append(items, PickerItem{ID: "", Label: "Clear label filter"})
+			for _, lbl := range labels {
+				items = append(items, PickerItem{ID: lbl.ID, Label: lbl.Name})
+			}
+			a.pickerActive = true
+			a.pickerModal.Show("Filter by Label", items, func(item PickerItem) {
+				a.pickerActive = false
+				if item.ID == "" {
+					a.filterLabelID = ""
+					a.filterLabelName = ""
+				} else {
+					a.filterLabelID = item.ID
+					a.filterLabelName = item.Label
+				}
+				a.updateStatusBar()
+				go a.refreshIssues()
+			})
+		})
+	}()
 }
 
 // handleDetailsKey handles keyboard input when details pane is focused.
@@ -1231,9 +1458,15 @@ func (a *App) refreshIssuesWithFocusChange(allowFocusChange bool, issueID ...str
 			First:   a.config.PageSize,
 			Search:  a.searchQuery,
 			OrderBy: string(a.sortField),
+			LabelID: a.filterLabelID,
 		}
 
-		// Apply team/project/state filter based on navigation selection
+		// Apply assignee-me filter
+		if a.filterAssigneeMe && a.currentUser != nil {
+			params.AssigneeID = a.currentUser.ID
+		}
+
+		// Apply team/project/state/cycle filter based on navigation selection
 		if a.selectedNavigation != nil {
 			switch {
 			case a.selectedNavigation.IsStatus:
@@ -1244,8 +1477,11 @@ func (a *App) refreshIssuesWithFocusChange(allowFocusChange bool, issueID ...str
 			case a.selectedNavigation.IsProject:
 				params.TeamID = a.selectedNavigation.TeamID
 				params.ProjectID = a.selectedNavigation.ID
+			case a.selectedNavigation.IsCycle:
+				params.TeamID = a.selectedNavigation.TeamID
+				params.CycleID = a.selectedNavigation.CycleID
 			}
-			// If "All Issues", no team/project filter
+			// If "All Issues", no team/project/cycle filter
 		}
 
 		fetchPage := a.fetchIssuesPage
@@ -1332,9 +1568,17 @@ func (a *App) refreshIssuesWithFocusChange(allowFocusChange bool, issueID ...str
 	})
 }
 
-// updateIssuesColumnLayout updates the issues column flex to show/hide My Issues table.
+// updateIssuesColumnLayout updates the issues column flex to show/hide My Issues table
+// and the cycle burndown panel.
 func (a *App) updateIssuesColumnLayout() {
 	a.issuesColumn.Clear()
+
+	// Show burndown panel when in cycle view
+	inCycleView := a.selectedNavigation != nil && a.selectedNavigation.IsCycle
+	if inCycleView && a.burndownPanel != nil {
+		a.updateBurndownPanel()
+		a.issuesColumn.AddItem(a.burndownPanel, 3, 0, false)
+	}
 
 	// Add My Issues table if there are any
 	if len(a.myIssueRows) > 0 {
@@ -1346,6 +1590,31 @@ func (a *App) updateIssuesColumnLayout() {
 
 	// Update all pane titles to reflect current state
 	a.updateAllPaneTitles()
+}
+
+// updateBurndownPanel refreshes the burndown panel content from the selected cycle.
+func (a *App) updateBurndownPanel() {
+	if a.burndownPanel == nil {
+		return
+	}
+	if a.selectedCycle != nil {
+		text := buildCycleBurndownText(a.selectedCycle, 20)
+		// Append per-assignee breakdown if issues are loaded
+		a.issuesMu.RLock()
+		issues := a.issues
+		a.issuesMu.RUnlock()
+		if len(issues) > 0 {
+			breakdown := buildAssigneeBreakdown(issues)
+			if breakdown != "" {
+				text = text + "\n" + breakdown
+			}
+		}
+		a.burndownPanel.SetText(text)
+		a.burndownPanel.SetTitle(" Cycle Burndown ")
+	} else {
+		a.burndownPanel.SetText("")
+		a.burndownPanel.SetTitle(" Cycle Burndown ")
+	}
 }
 
 // updateIssuesData updates the UI with new issues data.
@@ -1391,9 +1660,20 @@ func (a *App) rebuildIssuesTables(targetIssueID string) *linearapi.Issue {
 	}
 	myIssues, otherIssues := splitIssuesByAssignee(issues, currentUserID)
 
-	// Build hierarchical tree rows for each section.
-	a.myIssueRows, a.myIDToIssue = BuildIssueRows(myIssues, a.expandedState)
-	a.otherIssueRows, a.otherIDToIssue = BuildIssueRows(otherIssues, a.expandedState)
+	// In cycle view, group by project instead of hierarchical tree.
+	inCycleView := a.selectedNavigation != nil && a.selectedNavigation.IsCycle
+	if inCycleView {
+		projectNames := make(map[string]string)
+		for _, p := range a.teamProjects {
+			projectNames[p.ID] = p.Name
+		}
+		a.myIssueRows, a.myIDToIssue = BuildIssueRowsGroupedByProject(myIssues, a.expandedState, projectNames)
+		a.otherIssueRows, a.otherIDToIssue = BuildIssueRowsGroupedByProject(otherIssues, a.expandedState, projectNames)
+	} else {
+		// Build hierarchical tree rows for each section.
+		a.myIssueRows, a.myIDToIssue = BuildIssueRows(myIssues, a.expandedState)
+		a.otherIssueRows, a.otherIDToIssue = BuildIssueRows(otherIssues, a.expandedState)
+	}
 
 	// Legacy: keep old fields for backward compatibility during migration.
 	a.issueRows = make([]IssueRow, 0, len(a.myIssueRows)+len(a.otherIssueRows))
@@ -1618,27 +1898,66 @@ func (a *App) toggleIssueExpanded(issueID string) {
 
 // onNavigationSelected handles when a navigation item is selected.
 func (a *App) onNavigationSelected(node *NavigationNode) {
-	logger.Debug("tui.app: navigation selected node_id=%s node_text=%s is_team=%v is_project=%v", node.ID, node.Text, node.IsTeam, node.IsProject)
+	logger.Debug("tui.app: navigation selected node_id=%s node_text=%s is_team=%v is_project=%v is_cycle=%v is_notifications=%v", node.ID, node.Text, node.IsTeam, node.IsProject, node.IsCycle, node.IsNotifications)
 	a.selectedNavigation = node
 
-	// Update selected team/project
-	if node.IsTeam {
-		// Load team metadata (users, workflow states) in background
+	// Handle notifications view
+	if node.IsNotifications {
+		a.ClearBulkSelect()
+		a.LoadAndShowNotifications()
+		return
+	}
+
+	// Handle saved view selection
+	if node.IsSavedView && node.SavedView != nil {
+		a.applySavedView(*node.SavedView)
+		return
+	}
+
+	// Reset notifications view when navigating away
+	a.inNotificationsView = false
+
+	// Update selected team metadata
+	if node.IsTeam || node.IsProject || node.IsStatus || node.IsCycle {
+		teamID := node.TeamID
 		go func() {
-			logger.Debug("tui.app: preloading team metadata team_id=%s", node.TeamID)
+			logger.Debug("tui.app: preloading team metadata team_id=%s", teamID)
 			ctx := context.Background()
-			_ = a.cache.PreloadTeamMetadata(ctx, node.TeamID)
+			_ = a.cache.PreloadTeamMetadata(ctx, teamID)
 
-			// Update team users and states for the selected team
-			users, _ := a.cache.GetUsers(ctx, node.TeamID)
-			states, _ := a.cache.GetWorkflowStates(ctx, node.TeamID)
+			// Update team users, states, projects, and cycles for the selected team
+			users, _ := a.cache.GetUsers(ctx, teamID)
+			states, _ := a.cache.GetWorkflowStates(ctx, teamID)
+			projects, _ := a.cache.GetProjects(ctx, teamID)
+			cycles, _ := a.cache.GetCycles(ctx, teamID)
 
-			logger.Debug("tui.app: loaded team metadata team_id=%s users_count=%d states_count=%d", node.TeamID, len(users), len(states))
+			logger.Debug("tui.app: loaded team metadata team_id=%s users_count=%d states_count=%d cycles_count=%d", teamID, len(users), len(states), len(cycles))
 			a.app.QueueUpdateDraw(func() {
 				a.teamUsers = users
 				a.workflowStates = states
+				a.teamProjects = projects
+				a.cycles = cycles
+
+				// If navigating to a cycle node, record the selected cycle
+				if node.IsCycle {
+					a.selectedCycle = nil
+					for i := range a.cycles {
+						if a.cycles[i].ID == node.CycleID {
+							cyc := a.cycles[i]
+							a.selectedCycle = &cyc
+							break
+						}
+					}
+				} else {
+					a.selectedCycle = nil
+				}
+				a.updateBurndownPanel()
+				a.updateStatusBar()
 			})
 		}()
+	} else {
+		// "All Issues" or team-level: clear selectedCycle
+		a.selectedCycle = nil
 	}
 
 	// Refresh issues for the new selection - run in goroutine to avoid blocking
@@ -1693,6 +2012,8 @@ func (a *App) updateStatusBar() {
 			} else {
 				label = "Status"
 			}
+		} else if a.selectedNavigation.IsCycle && a.selectedCycle != nil {
+			label = fmt.Sprintf("Cycle: %s (%d%%)", a.selectedCycle.DisplayName(), a.selectedCycle.ProgressPercent())
 		}
 		navText = fmt.Sprintf("%s%s[-]", a.themeTags.Accent, label)
 	}
@@ -1710,6 +2031,21 @@ func (a *App) updateStatusBar() {
 		statusText = fmt.Sprintf("%sNo issues[-]", a.themeTags.SecondaryText)
 	}
 
+	bulkText := ""
+	if len(a.selectedIssueIDs) > 0 {
+		bulkText = fmt.Sprintf("%s%d selected[-]", a.themeTags.Warning, len(a.selectedIssueIDs))
+	}
+
+	filterMeText := ""
+	if a.filterAssigneeMe {
+		filterMeText = fmt.Sprintf("%s[me][-]", a.themeTags.Warning)
+	}
+
+	filterLabelText := ""
+	if a.filterLabelID != "" && a.filterLabelName != "" {
+		filterLabelText = fmt.Sprintf("%s[label: %s][-]", a.themeTags.Warning, a.filterLabelName)
+	}
+
 	sep := fmt.Sprintf("%s | [-]", a.themeTags.Border)
 
 	parts := []string{helpText}
@@ -1719,7 +2055,16 @@ func (a *App) updateStatusBar() {
 	if searchText != "" {
 		parts = append(parts, searchText)
 	}
+	if filterMeText != "" {
+		parts = append(parts, filterMeText)
+	}
+	if filterLabelText != "" {
+		parts = append(parts, filterLabelText)
+	}
 	parts = append(parts, statusText)
+	if bulkText != "" {
+		parts = append(parts, bulkText)
+	}
 
 	text := parts[0]
 	for i := 1; i < len(parts); i++ {
@@ -1912,6 +2257,34 @@ func (a *App) showUserPickerWithUsers(users []linearapi.User, onSelect func(user
 
 	a.pickerActive = true
 	a.pickerModal.Show("Select Assignee", items, func(item PickerItem) {
+		a.pickerActive = false
+		onSelect(item.ID)
+	})
+}
+
+// ShowCyclePicker shows a picker for selecting a cycle from the current team's cycles.
+func (a *App) ShowCyclePicker(onSelect func(cycleID string)) {
+	cycles := a.cycles
+	if len(cycles) == 0 {
+		logger.Warning("tui.app: no cycles available for picker")
+		a.updateStatusBarWithError(fmt.Errorf("no cycles available for the current team"))
+		return
+	}
+
+	items := make([]PickerItem, 0, len(cycles))
+	for _, cyc := range cycles {
+		label := cyc.DisplayName()
+		if cyc.ProgressPercent() > 0 {
+			label += fmt.Sprintf(" (%d%%)", cyc.ProgressPercent())
+		}
+		items = append(items, PickerItem{
+			ID:    cyc.ID,
+			Label: label,
+		})
+	}
+
+	a.pickerActive = true
+	a.pickerModal.Show("Select Cycle", items, func(item PickerItem) {
 		a.pickerActive = false
 		onSelect(item.ID)
 	})
@@ -2134,4 +2507,201 @@ func (a *App) ShowPromptTemplatesModal() {
 		a.agentPromptModal = NewAgentPromptModal(a)
 		return nil
 	})
+}
+
+// ShowPriorityPicker shows a picker for selecting issue priority.
+func (a *App) ShowPriorityPicker(onSelect func(priority int)) {
+	items := []PickerItem{
+		{ID: "1", Label: "! Urgent"},
+		{ID: "2", Label: "↑ High"},
+		{ID: "3", Label: "→ Medium"},
+		{ID: "4", Label: "↓ Low"},
+		{ID: "0", Label: "- No Priority"},
+	}
+
+	a.pickerActive = true
+	a.pickerModal.Show("Select Priority", items, func(item PickerItem) {
+		a.pickerActive = false
+		priority := 0
+		switch item.ID {
+		case "1":
+			priority = 1
+		case "2":
+			priority = 2
+		case "3":
+			priority = 3
+		case "4":
+			priority = 4
+		}
+		onSelect(priority)
+	})
+}
+
+// ShowEstimatePicker shows a picker for selecting a story point estimate.
+func (a *App) ShowEstimatePicker(onSelect func(estimate *float64)) {
+	items := []PickerItem{
+		{ID: "clear", Label: "Clear estimate"},
+		{ID: "0", Label: "0 points"},
+		{ID: "1", Label: "1 point"},
+		{ID: "2", Label: "2 points"},
+		{ID: "3", Label: "3 points"},
+		{ID: "5", Label: "5 points"},
+		{ID: "8", Label: "8 points"},
+		{ID: "13", Label: "13 points"},
+	}
+
+	a.pickerActive = true
+	a.pickerModal.Show("Select Estimate", items, func(item PickerItem) {
+		a.pickerActive = false
+		if item.ID == "clear" {
+			onSelect(nil)
+			return
+		}
+		var val float64
+		switch item.ID {
+		case "0":
+			val = 0
+		case "1":
+			val = 1
+		case "2":
+			val = 2
+		case "3":
+			val = 3
+		case "5":
+			val = 5
+		case "8":
+			val = 8
+		case "13":
+			val = 13
+		}
+		onSelect(&val)
+	})
+}
+
+// ShowDueDateModal shows the due date input modal.
+func (a *App) ShowDueDateModal(issueID, currentDate string, onUpdate func(issueID, date string)) {
+	if a.dueDateModal == nil {
+		a.dueDateModal = NewDueDateModal(a)
+	}
+	a.dueDateModal.Show(issueID, currentDate, onUpdate)
+}
+
+// ShowRelationModal shows the create relation modal.
+func (a *App) ShowRelationModal(issueID string, onCreate func(issueID, relatedIssueID, relationType string)) {
+	if a.relationModal == nil {
+		a.relationModal = NewRelationModal(a)
+	}
+	a.relationModal.Show(issueID, onCreate)
+}
+
+// ToggleBulkSelect toggles the bulk selection state for an issue.
+func (a *App) ToggleBulkSelect(issueID string) {
+	if a.selectedIssueIDs == nil {
+		a.selectedIssueIDs = make(map[string]bool)
+	}
+	if a.selectedIssueIDs[issueID] {
+		delete(a.selectedIssueIDs, issueID)
+	} else {
+		a.selectedIssueIDs[issueID] = true
+	}
+	// Re-render both tables to reflect selection state
+	selectedMyID := a.selectedIssueID(IssuesSectionMy)
+	selectedOtherID := a.selectedIssueID(IssuesSectionOther)
+	renderIssuesTableModel(a.myIssuesTable, a.myIssueRows, a.myIDToIssue, selectedMyID, a.theme, a.selectedIssueIDs)
+	renderIssuesTableModel(a.otherIssuesTable, a.otherIssueRows, a.otherIDToIssue, selectedOtherID, a.theme, a.selectedIssueIDs)
+	a.updateStatusBar()
+}
+
+// ClearBulkSelect clears all bulk selections.
+func (a *App) ClearBulkSelect() {
+	a.selectedIssueIDs = make(map[string]bool)
+	selectedMyID := a.selectedIssueID(IssuesSectionMy)
+	selectedOtherID := a.selectedIssueID(IssuesSectionOther)
+	renderIssuesTableModel(a.myIssuesTable, a.myIssueRows, a.myIDToIssue, selectedMyID, a.theme, a.selectedIssueIDs)
+	renderIssuesTableModel(a.otherIssuesTable, a.otherIssueRows, a.otherIDToIssue, selectedOtherID, a.theme, a.selectedIssueIDs)
+	a.updateStatusBar()
+}
+
+// ShowUserPickerWithUnassign shows a user picker with "Unassign" option at the top.
+func (a *App) ShowUserPickerWithUnassign(onSelect func(userID string)) {
+	logger.Debug("tui.app: showing user picker with unassign")
+	users := a.teamUsers
+	if len(users) == 0 {
+		a.loadPickerData(
+			"users for picker",
+			func() bool { return len(a.teamUsers) > 0 },
+			func(ctx context.Context, teamID string) error {
+				loadedUsers, err := a.cache.GetUsers(ctx, teamID)
+				if err != nil {
+					return err
+				}
+				a.teamUsers = loadedUsers
+				return nil
+			},
+			func() {
+				a.showUserPickerWithUnassignUsers(a.teamUsers, onSelect)
+			},
+		)
+		return
+	}
+	a.showUserPickerWithUnassignUsers(users, onSelect)
+}
+
+func (a *App) showUserPickerWithUnassignUsers(users []linearapi.User, onSelect func(userID string)) {
+	items := make([]PickerItem, 0, len(users)+1)
+	// Unassign at top
+	items = append(items, PickerItem{ID: "", Label: "Unassign"})
+	for _, user := range users {
+		label := user.Name
+		if user.IsMe {
+			label += " (me)"
+		}
+		items = append(items, PickerItem{
+			ID:    user.ID,
+			Label: label,
+		})
+	}
+
+	a.pickerActive = true
+	a.pickerModal.Show("Select Assignee", items, func(item PickerItem) {
+		a.pickerActive = false
+		onSelect(item.ID)
+	})
+}
+
+// LoadAndShowNotifications fetches notifications and displays them.
+func (a *App) LoadAndShowNotifications() {
+	a.inNotificationsView = true
+	a.statusBar.SetText(fmt.Sprintf("%sLoading notifications...[-]", a.themeTags.Warning))
+	go func() {
+		ctx := context.Background()
+		notifications, err := a.api.FetchNotifications(ctx)
+		a.QueueUpdateDraw(func() {
+			if err != nil {
+				logger.ErrorWithErr(err, "tui.app: failed to fetch notifications")
+				a.updateStatusBarWithError(err)
+				a.inNotificationsView = false
+				return
+			}
+			a.notifications = notifications
+			a.renderNotificationsView()
+			a.updateStatusBar()
+		})
+	}()
+}
+
+// renderNotificationsView renders notifications in the issues tables area.
+func (a *App) renderNotificationsView() {
+	// Clear tables and show notifications in the other issues table
+	a.myIssueRows = nil
+	a.myIDToIssue = make(map[string]*linearapi.Issue)
+	a.otherIssueRows = make([]IssueRow, 0, len(a.notifications))
+	a.otherIDToIssue = make(map[string]*linearapi.Issue)
+
+	// Render notifications as a simple table
+	renderNotificationsTable(a.otherIssuesTable, a.notifications, a.theme)
+	a.myIssuesTable.Clear()
+
+	// Update layout
+	a.updateIssuesColumnLayout()
 }
